@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::time::Duration;
-use tracing::{debug, info, instrument};
+use tracing::{info, instrument};
 
 use crate::domain::{
     AppError, CreateItemRequest, DatabaseClient, DatabaseError, Item, ItemMetadata,
@@ -125,7 +125,7 @@ impl DatabaseClient for PostgresClient {
         let metadata_json = data
             .metadata
             .as_ref()
-            .map(|m| serde_json::to_value(m))
+            .map(serde_json::to_value)
             .transpose()
             .map_err(|e| AppError::Serialization(e.to_string()))?;
 

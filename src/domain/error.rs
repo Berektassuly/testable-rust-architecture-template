@@ -112,10 +112,8 @@ impl From<sqlx::Error> for DatabaseError {
             sqlx::Error::RowNotFound => DatabaseError::NotFound("Row not found".to_string()),
             sqlx::Error::PoolTimedOut => DatabaseError::PoolExhausted("Pool timed out".to_string()),
             sqlx::Error::Database(db_err) => {
-                if let Some(code) = db_err.code() {
-                    if code == "23505" {
-                        return DatabaseError::Duplicate(db_err.message().to_string());
-                    }
+                if db_err.code().is_some_and(|code| code == "23505") {
+                    return DatabaseError::Duplicate(db_err.message().to_string());
                 }
                 DatabaseError::Query(db_err.message().to_string())
             }

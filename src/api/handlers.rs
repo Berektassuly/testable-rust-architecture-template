@@ -7,8 +7,8 @@ use tracing::error;
 
 use crate::app::AppState;
 use crate::domain::{
-    AppError, BlockchainError, ConfigError, CreateItemRequest, DatabaseError, ExternalServiceError,
-    HealthResponse, HealthStatus, Item, ValidationError,
+    AppError, BlockchainError, CreateItemRequest, DatabaseError, ExternalServiceError,
+    HealthResponse, HealthStatus, Item,
 };
 
 pub async fn create_item_handler(

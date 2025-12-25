@@ -6,7 +6,7 @@ use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tracing::{debug, info, instrument, warn};
+use tracing::{info, instrument, warn};
 
 use crate::domain::{AppError, BlockchainClient, BlockchainError};
 

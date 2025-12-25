@@ -20,7 +20,6 @@ use super::handlers::{
     create_item_handler, health_check_handler, liveness_handler, readiness_handler,
 };
 
-#[must_use]
 pub fn create_router(app_state: Arc<AppState>) -> Router {
     let middleware = ServiceBuilder::new()
         .layer(
@@ -44,7 +43,6 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
 
 /// Creates a router with rate limiting enabled.
 /// Note: Rate limiting temporarily disabled due to tower_governor incompatibility with axum 0.8
-#[must_use]
 pub fn create_router_with_rate_limit(app_state: Arc<AppState>) -> Router {
     // TODO: Re-enable when tower_governor supports axum 0.8
     create_router(app_state)
