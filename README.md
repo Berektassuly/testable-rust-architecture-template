@@ -234,4 +234,4 @@ CMD ["testable-rust-architecture-template"]
 
 ## 📄 License
 
-MIT
+[MIT](LICENSE) © [Mukhammedali Berektassuly](https://berektassuly.com)
