@@ -1,7 +1,4 @@
-//! Concrete database client implementations.
-//!
-//! This module contains production-ready database adapters that implement
-//! the `DatabaseClient` trait defined in the domain layer.
+//! Database client implementations.
 
 pub mod postgres;
 
