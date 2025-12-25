@@ -1,47 +1,23 @@
-# Cargo build configuration for improved developer experience.
-#
-# This configuration uses the LLVM linker (lld) which is significantly faster
-# than the default system linker, especially for large projects with many
-# dependencies like those using Solana SDK.
-#
-# INSTALLATION:
-# You may need to install lld separately:
-#   - Ubuntu/Debian: sudo apt install lld
-#   - Fedora: sudo dnf install lld
-#   - macOS: brew install llvm (then ensure llvm's bin is in PATH)
-#   - Arch Linux: sudo pacman -S lld
-#
-# If lld is not available, you can comment out or remove the [build] section
-# below, and Cargo will fall back to the default system linker.
-
 [build]
-# Use lld linker for faster linking times during development.
-# This can reduce link times from 30+ seconds to under 5 seconds.
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
-
-# Alternative configurations for different platforms:
-#
-# For macOS with Apple Silicon (if lld doesn't work):
-# rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/llvm/bin/ld64.lld"]
-#
-# For Windows with MSVC:
-# rustflags = ["-C", "link-arg=/DEBUG:NONE"]
-#
-# For using mold linker (even faster than lld, Linux only):
-# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+# Use all available CPU cores for compilation
+jobs = -1
 
 [target.x86_64-unknown-linux-gnu]
-# Linux-specific linker configuration
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+# Use mold linker if available (faster linking)
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
-[target.aarch64-unknown-linux-gnu]
-# Linux ARM64 configuration
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+[alias]
+# Useful aliases
+t = "test"
+c = "check"
+b = "build"
+r = "run"
+br = "build --release"
+rr = "run --release"
+lint = "clippy -- -D warnings"
+fmt-check = "fmt --check"
 
-[target.x86_64-apple-darwin]
-# macOS Intel configuration
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
-
-[target.aarch64-apple-darwin]
-# macOS Apple Silicon configuration
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+[env]
+# Default environment for development
+RUST_BACKTRACE = "1"

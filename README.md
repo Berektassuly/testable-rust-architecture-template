@@ -1,180 +1,307 @@
-# testable-rust-architecture-template
+# 🏗️ Testable Rust Architecture Template
 
-> A production-ready Rust template demonstrating testable architecture through trait-based abstraction and dependency injection for services interacting with external systems.
+A production-ready Rust template demonstrating testable architecture through trait-based abstraction and dependency injection.
 
-This template implements the architectural principles described in the article **["Architecture as LEGO: Building a Testable Rust Service with Blockchain Abstraction"](https://berektassuly.com/architecture-as-lego-rust-testing)**. If you want to understand the reasoning behind every design decision, that article is the definitive guide.
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## Core Concepts
+## ✨ Features
 
-This template demonstrates the following architectural patterns:
+- **🧱 Clean Architecture** - Layered design with clear separation of concerns
+- **💉 Dependency Injection** - Trait-based abstractions for testability
+- **🔒 Security First** - Secret management, input validation, rate limiting
+- **⚡ High Performance** - Connection pooling, async/await throughout
+- **🧪 Comprehensive Testing** - Unit tests, integration tests, mock utilities
+- **📊 Observability** - Structured logging with tracing, health checks
+- **🚀 Production Ready** - Graceful shutdown, proper error handling
 
-- **Trait-based abstraction over external dependencies** — Define interfaces that describe *what* external systems should do, not *how* they do it.
-- **Async trait pattern for I/O-bound operations** — Use `async-trait` to enable async methods in traits, accepting the minor heap allocation overhead since it's negligible compared to actual I/O latency.
-- **Dynamic dispatch via `Arc<dyn Trait>`** — Prefer trait objects over generics when you need runtime implementation swapping, smaller binaries, and simpler integration with web frameworks.
-- **In-memory mock implementations** — Create mock implementations using simple data structures (like `HashMap`) that satisfy the trait contract, enabling millisecond-speed unit tests.
-- **Dependency injection through shared application state** — Inject trait objects into a centralized `AppState` struct, keeping concrete implementation selection at the composition root.
-- **Separation of business logic from infrastructure** — Handlers interact only with trait abstractions, remaining completely unaware of whether they're talking to PostgreSQL, Solana, or an in-memory mock.
-- **Design for replaceability, not prediction** — Build architecture that makes future changes easy to implement rather than trying to anticipate every possible requirement upfront.
+## 📁 Project Structure
 
-## Why This Architecture? (The Trade-offs)
-
-Every architectural decision involves trade-offs. This template makes specific choices that prioritize **testability** and **long-term maintainability** over short-term convenience. Here's an honest assessment:
-
-### ✅ Advantages
-
-| Benefit | Description |
-|---------|-------------|
-| **Speed** | Unit tests run in milliseconds without network access, databases, or blockchain nodes. Your CI/CD pipeline stays fast and deterministic. |
-| **Replaceability** | Need to swap Solana for Ethereum? Write a new adapter implementing `BlockchainClient`. Your business logic remains completely untouched. |
-| **Clarity** | Business logic is clean and readable, free from HTTP client configuration, SQL query building, or blockchain SDK details. |
-| **Familiarity** | Developers from Java (Spring), C# (.NET), or Go backgrounds will find this architecture immediately intuitive. |
-
-### ❌ Conscious Trade-offs
-
-| Trade-off | Description |
-|-----------|-------------|
-| **Boilerplate** | You must define traits, then structs, then implement them. For simple CRUD applications, this can feel like overengineering. *This trade-off is made consciously to achieve maximum testability and long-term maintainability. The upfront investment pays dividends as the codebase grows.* |
-| **Manual Mocks** | Writing mock clients takes time, unlike using auto-mocking libraries like `mockall`. *This is intentional—hand-written mocks are explicit, debuggable, and serve as living documentation of expected behavior.* |
-| **Dynamic Dispatch** | Performance purists may object to `dyn Trait` and vtable lookups. *In practice, this overhead is negligible for I/O-bound web services where network latency dominates. We choose flexibility over nanoseconds.* |
-
-**Bottom line:** If you're building a quick prototype or a simple CRUD app, this architecture may be overkill. But if you're building a service that will evolve over time, integrate with multiple external systems, or require comprehensive test coverage—this template provides a solid foundation.
-
-## Project Structure
 ```
-.
-├── .cargo/
-│   └── config.toml          # Build optimizations (faster linking)
-├── src/
-│   ├── domain/              # Core business types and trait definitions
-│   │   ├── mod.rs
-│   │   ├── error.rs         # Application error types
-│   │   ├── traits.rs        # DatabaseClient, BlockchainClient traits
-│   │   └── types.rs         # Domain models (Item, CreateItemRequest, etc.)
-│   ├── app/                 # Application logic and state
-│   │   ├── mod.rs
-│   │   ├── service.rs       # Business logic orchestration
-│   │   └── state.rs         # Shared AppState with injected dependencies
-│   ├── infra/               # Concrete implementations of domain traits
-│   │   ├── mod.rs
-│   │   ├── database/
-│   │   │   ├── mod.rs
-│   │   │   └── postgres.rs  # PostgreSQL implementation of DatabaseClient
-│   │   └── blockchain/
-│   │       ├── mod.rs
-│   │       └── solana.rs    # RPC-based blockchain client implementation
-│   ├── api/                 # HTTP layer (Axum handlers and routing)
-│   │   ├── mod.rs
-│   │   ├── handlers.rs      # Request handlers
-│   │   └── router.rs        # Route definitions
-│   ├── lib.rs               # Library entry point
-│   └── main.rs              # Application entry point
-├── tests/
-│   └── integration_test.rs  # End-to-end tests with mock implementations
-├── .env.example             # Environment variable template
-├── .gitignore
-├── Cargo.toml
-├── LICENSE
-└── README.md
+src/
+├── api/                    # HTTP layer
+│   ├── handlers.rs         # Request handlers
+│   ├── router.rs           # Route configuration & middleware
+│   └── mod.rs
+├── app/                    # Application layer
+│   ├── service.rs          # Business logic orchestration
+│   ├── state.rs            # Shared application state
+│   └── mod.rs
+├── domain/                 # Domain layer (no dependencies)
+│   ├── error.rs            # Hierarchical error types
+│   ├── traits.rs           # Contracts for external systems
+│   ├── types.rs            # Domain models with validation
+│   └── mod.rs
+├── infra/                  # Infrastructure layer
+│   ├── database/
+│   │   ├── postgres.rs     # PostgreSQL implementation
+│   │   └── mod.rs
+│   ├── blockchain/
+│   │   ├── solana.rs       # Blockchain RPC client
+│   │   └── mod.rs
+│   └── mod.rs
+├── test_utils/             # Shared test utilities
+│   ├── mocks.rs            # Mock implementations
+│   └── mod.rs
+├── lib.rs                  # Library entry point
+└── main.rs                 # Application entry point
+
+tests/
+└── integration_test.rs     # Integration tests
 ```
 
-### Layer Responsibilities
+## 🏛️ Architecture
 
-| Layer | Purpose |
-|-------|---------|
-| **`domain/`** | Defines the contracts (traits) that external systems must fulfill, plus shared types and errors. Has **zero dependencies** on infrastructure or frameworks. |
-| **`app/`** | Contains business logic that orchestrates operations through trait abstractions. Knows nothing about PostgreSQL, Solana, or HTTP. |
-| **`infra/`** | Provides concrete implementations (adapters) for databases, blockchains, and external APIs. This is where SDK-specific code lives. |
-| **`api/`** | Handles HTTP concerns: request parsing, response formatting, routing. Delegates all business logic to the `app` layer. |
+```
+┌─────────────────────────────────────────────┐
+│                  API Layer                   │
+│    HTTP handlers, routing, validation        │
+├─────────────────────────────────────────────┤
+│              Application Layer               │
+│     Business logic, service orchestration    │
+├─────────────────────────────────────────────┤
+│                Domain Layer                  │
+│      Traits, types, errors (pure Rust)       │
+├─────────────────────────────────────────────┤
+│             Infrastructure Layer             │
+│   Database adapters, blockchain clients      │
+└─────────────────────────────────────────────┘
+```
 
-## Getting Started
+### Key Design Principles
+
+1. **Dependency Inversion** - High-level modules don't depend on low-level modules
+2. **Interface Segregation** - Small, focused traits (`DatabaseClient`, `BlockchainClient`)
+3. **Single Responsibility** - Each module has one reason to change
+4. **Testability** - All external dependencies are mockable
+
+## 🚀 Quick Start
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (1.75 or later recommended)
-- [PostgreSQL](https://www.postgresql.org/) (for production use)
-- [lld linker](https://lld.llvm.org/) (optional, for faster builds)
+- Rust 1.75 or later
+- PostgreSQL 14+
+- (Optional) Solana CLI for key generation
 
-### Installation
+### Setup
 
-1. **Clone the repository:**
-```bash
-   git clone https://github.com/your-username/testable-rust-architecture-template.git
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/Berektassuly/testable-rust-architecture-template.git
    cd testable-rust-architecture-template
-```
+   ```
 
-2. **Copy the environment template:**
-```bash
+2. **Configure environment**
+   ```bash
    cp .env.example .env
-```
+   # Edit .env with your database credentials
+   ```
 
-3. **Configure your environment:**
+3. **Create database**
+   ```bash
+   createdb app_dev
+   ```
 
-   Edit `.env` with your actual values:
-```bash
-   # Database connection
-   DATABASE_URL=postgres://postgres:postgres@localhost:5432/app_dev
-
-   # Blockchain RPC endpoint (defaults to Solana devnet)
-   SOLANA_RPC_URL=https://api.devnet.solana.com
-
-   # Your signing key (or leave as placeholder for development)
-   ISSUER_PRIVATE_KEY="YOUR_BASE58_ENCODED_PRIVATE_KEY_HERE"
-```
-
-4. **Build the project:**
-```bash
-   cargo build
-```
-
-5. **Run the server:**
-```bash
+4. **Run the application**
+   ```bash
    cargo run
-```
+   ```
 
-   You should see output like:
-```
-   ⚠️  No valid ISSUER_PRIVATE_KEY provided, generating ephemeral keypair
-      This is fine for development, but set a real key for production!
-   🔑 Using public key: 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU
-   🚀 Server starting on http://0.0.0.0:3000
-```
+5. **Test the API**
+   ```bash
+   # Health check
+   curl http://localhost:3000/health
 
-> **Note:** The application will compile and start, but database operations will panic until you implement the `todo!()` placeholders in `src/infra/database/postgres.rs`. This is intentional—the template provides the architecture, you provide the implementation.
+   # Create an item
+   curl -X POST http://localhost:3000/items \
+     -H "Content-Type: application/json" \
+     -d '{"name": "My Item", "content": "Hello World"}'
+   ```
 
-## Running Tests
+## 🧪 Testing
+
+### Run all tests
+
 ```bash
 cargo test
 ```
 
-### Why Are the Tests So Fast?
+### Run with coverage
 
-The tests run in **milliseconds** because they use **in-memory mock implementations** instead of real external services:
+```bash
+cargo install cargo-tarpaulin
+cargo tarpaulin --out Html
+```
 
-- **No database required** — `MockDatabaseClient` uses a `HashMap` for storage
-- **No blockchain required** — `MockBlockchainClient` returns instant responses
-- **No network I/O** — Everything runs in-process
+### Test structure
 
-This is the primary benefit of trait-based abstraction: your business logic can be thoroughly tested without spinning up Docker containers, waiting for network timeouts, or paying for test transactions.
+- **Unit tests** - In each module (`#[cfg(test)]`)
+- **Integration tests** - In `tests/` directory
+- **Mock utilities** - In `src/test_utils/`
+
+### Example: Testing with mocks
+
 ```rust
-// From tests/integration_test.rs
+use testable_rust_architecture_template::test_utils::{
+    MockDatabaseClient, MockBlockchainClient
+};
+
 #[tokio::test]
-async fn test_create_item_success_e2e() {
-    // Arrange: Create mock clients (no real DB or blockchain!)
-    let mock_db = Arc::new(MockDatabaseClient::new());
-    let mock_blockchain = Arc::new(MockBlockchainClient::new());
+async fn test_service_with_mocks() {
+    let db = Arc::new(MockDatabaseClient::new());
+    let blockchain = Arc::new(MockBlockchainClient::new());
+    let service = AppService::new(db, blockchain);
 
-    let app_state = AppState::new(mock_db, mock_blockchain);
-    let router = create_router(Arc::new(app_state));
+    let result = service.create_and_submit_item(&request).await;
+    assert!(result.is_ok());
+}
+```
 
-    // Act & Assert: Full request/response cycle in milliseconds
+## 📡 API Endpoints
+
+| Method | Path           | Description           |
+|--------|----------------|-----------------------|
+| POST   | `/items`       | Create a new item     |
+| GET    | `/health`      | Detailed health check |
+| GET    | `/health/live` | Liveness probe (k8s)  |
+| GET    | `/health/ready`| Readiness probe (k8s) |
+
+### Create Item Request
+
+```json
+{
+  "name": "Item Name",
+  "content": "Item content (required)",
+  "description": "Optional description",
+  "metadata": {
+    "author": "Optional author",
+    "version": "1.0.0",
+    "tags": ["tag1", "tag2"],
+    "custom_fields": {
+      "key": "value"
+    }
+  }
+}
+```
+
+### Health Check Response
+
+```json
+{
+  "status": "healthy",
+  "database": "healthy",
+  "blockchain": "healthy",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "version": "0.2.0"
+}
+```
+
+## 🔒 Security Features
+
+### Input Validation
+
+All request payloads are validated using the `validator` crate:
+
+```rust
+#[derive(Validate)]
+pub struct CreateItemRequest {
+    #[validate(length(min = 1, max = 255))]
+    pub name: String,
+
+    #[validate(length(max = 1_048_576))]  // 1MB max
+    pub content: String,
+}
+```
+
+### Secret Management
+
+Sensitive data is protected using the `secrecy` crate:
+
+```rust
+use secrecy::{Secret, ExposeSecret};
+
+let private_key: Secret<String> = Secret::new(key_string);
+// Key is never accidentally logged
+```
+
+### Rate Limiting
+
+Enable rate limiting in production:
+
+```bash
+ENABLE_RATE_LIMITING=true
+```
+
+Configured for 10 requests/second with burst of 50.
+
+## 📊 Observability
+
+### Structured Logging
+
+Uses `tracing` for structured, contextual logging:
+
+```rust
+#[instrument(skip(self), fields(item_name = %request.name))]
+pub async fn create_and_submit_item(&self, request: &CreateItemRequest) {
+    info!("Creating new item");
     // ...
 }
 ```
 
-## License
+### Log Levels
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+Configure via `RUST_LOG` environment variable:
 
----
+```bash
+# Development
+RUST_LOG=debug,tower_http=trace
 
-Built with ❤️ to demonstrate that **testable architecture in Rust doesn't have to be complicated**—just intentional.
+# Production
+RUST_LOG=info,sqlx=warn
+```
+
+## ⚙️ Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABASE_URL` | Required | PostgreSQL connection string |
+| `SOLANA_RPC_URL` | devnet | Blockchain RPC endpoint |
+| `ISSUER_PRIVATE_KEY` | Generated | Ed25519 signing key |
+| `HOST` | `0.0.0.0` | Server bind address |
+| `PORT` | `3000` | Server port |
+| `ENABLE_RATE_LIMITING` | `false` | Enable rate limiting |
+| `RUST_LOG` | `info` | Log level filter |
+
+## 🐳 Docker Support
+
+```dockerfile
+FROM rust:1.75-slim as builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+COPY --from=builder /app/target/release/testable-rust-architecture-template /usr/local/bin/
+CMD ["testable-rust-architecture-template"]
+```
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Run tests (`cargo test`)
+4. Run clippy (`cargo clippy -- -D warnings`)
+5. Commit your changes (`git commit -m 'Add amazing feature'`)
+6. Push to the branch (`git push origin feature/amazing-feature`)
+7. Open a Pull Request
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 🙏 Acknowledgments
+
+- [Axum](https://github.com/tokio-rs/axum) - Web framework
+- [SQLx](https://github.com/launchbadge/sqlx) - Async database driver
+- [Tokio](https://tokio.rs/) - Async runtime
+- [Tracing](https://tracing.rs/) - Structured logging

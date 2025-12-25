@@ -1,81 +1,137 @@
+//! Application error types with proper error chaining.
+//!
+//! This module provides a hierarchical error system that preserves
+//! error context and enables proper error handling at each layer.
+
 use thiserror::Error;
 
+/// Database-specific errors.
 #[derive(Error, Debug)]
-pub enum AppError {
-    // Configuration errors
-    #[error("Configuration error: {0}")]
-    Config(String),
+pub enum DatabaseError {
+    #[error("Connection failed: {0}")]
+    Connection(String),
 
-    #[error("Missing environment variable: {0}")]
-    MissingEnvVar(String),
-
-    #[error("Invalid configuration value for '{key}': {message}")]
-    InvalidConfigValue { key: String, message: String },
-
-    // Infrastructure errors - Database
-    #[error("Database error: {0}")]
-    Database(String),
-
-    #[error("Database connection failed: {0}")]
-    DatabaseConnection(String),
+    #[error("Query execution failed: {0}")]
+    Query(String),
 
     #[error("Record not found: {0}")]
     NotFound(String),
 
     #[error("Duplicate record: {0}")]
-    DuplicateRecord(String),
+    Duplicate(String),
 
-    // Infrastructure errors - Blockchain
-    #[error("Blockchain error: {0}")]
-    Blockchain(String),
+    #[error("Pool exhausted: {0}")]
+    PoolExhausted(String),
 
-    #[error("Blockchain connection failed: {0}")]
-    BlockchainConnection(String),
+    #[error("Migration failed: {0}")]
+    Migration(String),
+}
+
+/// Blockchain-specific errors.
+#[derive(Error, Debug)]
+pub enum BlockchainError {
+    #[error("Connection failed: {0}")]
+    Connection(String),
+
+    #[error("RPC call failed: {0}")]
+    RpcError(String),
 
     #[error("Transaction failed: {0}")]
     TransactionFailed(String),
 
-    #[error("Invalid transaction signature: {0}")]
+    #[error("Invalid signature: {0}")]
     InvalidSignature(String),
 
     #[error("Insufficient funds for transaction")]
     InsufficientFunds,
 
-    // Infrastructure errors - External services
-    #[error("External service error: {0}")]
-    ExternalService(String),
+    #[error("Timeout waiting for confirmation: {0}")]
+    Timeout(String),
+}
 
+/// Configuration-specific errors.
+#[derive(Error, Debug)]
+pub enum ConfigError {
+    #[error("Missing environment variable: {0}")]
+    MissingEnvVar(String),
+
+    #[error("Invalid value for '{key}': {message}")]
+    InvalidValue { key: String, message: String },
+
+    #[error("Parse error: {0}")]
+    ParseError(String),
+}
+
+/// Validation-specific errors.
+#[derive(Error, Debug)]
+pub enum ValidationError {
+    #[error("Invalid field '{field}': {message}")]
+    InvalidField { field: String, message: String },
+
+    #[error("Missing required field: {0}")]
+    MissingField(String),
+
+    #[error("Invalid format: {0}")]
+    InvalidFormat(String),
+
+    #[error("Validation failed: {0}")]
+    Multiple(String),
+}
+
+/// External service errors.
+#[derive(Error, Debug)]
+pub enum ExternalServiceError {
     #[error("HTTP request failed: {0}")]
-    HttpRequest(String),
+    HttpError(String),
 
-    #[error("Service timeout: {0}")]
+    #[error("Service unavailable: {0}")]
+    Unavailable(String),
+
+    #[error("Timeout: {0}")]
     Timeout(String),
 
-    // Validation errors
-    #[error("Validation error: {0}")]
-    Validation(String),
+    #[error("Rate limited: {0}")]
+    RateLimited(String),
+}
 
-    #[error("Invalid input: {field} - {message}")]
-    InvalidInput { field: String, message: String },
+/// Main application error type.
+///
+/// This enum aggregates all domain-specific errors and provides
+/// a unified error handling interface for the application.
+#[derive(Error, Debug)]
+pub enum AppError {
+    // Infrastructure errors
+    #[error(transparent)]
+    Database(#[from] DatabaseError),
 
-    #[error("Invalid hash format: {0}")]
-    InvalidHash(String),
+    #[error(transparent)]
+    Blockchain(#[from] BlockchainError),
 
-    // Serialization errors
-    #[error("Serialization error: {0}")]
-    Serialization(String),
+    #[error(transparent)]
+    ExternalService(#[from] ExternalServiceError),
 
-    #[error("Deserialization error: {0}")]
-    Deserialization(String),
+    // Application errors
+    #[error(transparent)]
+    Config(#[from] ConfigError),
 
-    // Authentication/Authorization errors
+    #[error(transparent)]
+    Validation(#[from] ValidationError),
+
+    // Authentication/Authorization
     #[error("Authentication failed: {0}")]
     Authentication(String),
 
     #[error("Authorization denied: {0}")]
     Authorization(String),
 
-    // Generic errors
+    // Serialization
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+
+    #[error("Deserialization error: {0}")]
+    Deserialization(String),
+
+    // Generic
     #[error("Internal error: {0}")]
     Internal(String),
 
@@ -87,7 +143,7 @@ pub enum AppError {
 
 impl From<std::env::VarError> for AppError {
     fn from(err: std::env::VarError) -> Self {
-        AppError::MissingEnvVar(err.to_string())
+        AppError::Config(ConfigError::MissingEnvVar(err.to_string()))
     }
 }
 
@@ -107,69 +163,105 @@ impl From<serde_json::Error> for AppError {
     }
 }
 
-// Result type alias for convenience
+impl From<validator::ValidationErrors> for AppError {
+    fn from(err: validator::ValidationErrors) -> Self {
+        AppError::Validation(ValidationError::Multiple(err.to_string()))
+    }
+}
+
+impl From<sqlx::Error> for DatabaseError {
+    fn from(err: sqlx::Error) -> Self {
+        match err {
+            sqlx::Error::RowNotFound => DatabaseError::NotFound("Row not found".to_string()),
+            sqlx::Error::PoolTimedOut => {
+                DatabaseError::PoolExhausted("Connection pool timed out".to_string())
+            }
+            sqlx::Error::Database(db_err) => {
+                if let Some(code) = db_err.code() {
+                    if code == "23505" {
+                        return DatabaseError::Duplicate(db_err.message().to_string());
+                    }
+                }
+                DatabaseError::Query(db_err.message().to_string())
+            }
+            _ => DatabaseError::Query(err.to_string()),
+        }
+    }
+}
+
+/// Result type alias for convenience.
 pub type AppResult<T> = Result<T, AppError>;
+
+/// Extension trait for adding context to errors.
+pub trait ResultExt<T> {
+    /// Add context to an error.
+    fn with_context<F, S>(self, f: F) -> Result<T, AppError>
+    where
+        F: FnOnce() -> S,
+        S: Into<String>;
+}
+
+impl<T, E: Into<AppError>> ResultExt<T> for Result<T, E> {
+    fn with_context<F, S>(self, f: F) -> Result<T, AppError>
+    where
+        F: FnOnce() -> S,
+        S: Into<String>,
+    {
+        self.map_err(|e| {
+            let app_error = e.into();
+            // Log the context for debugging
+            tracing::error!(context = %f().into(), error = ?app_error, "Error with context");
+            app_error
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_config_error_display() {
-        let error = AppError::Config("invalid port number".to_string());
-        assert_eq!(error.to_string(), "Configuration error: invalid port number");
-    }
-
-    #[test]
-    fn test_missing_env_var_display() {
-        let error = AppError::MissingEnvVar("DATABASE_URL".to_string());
-        assert_eq!(error.to_string(), "Missing environment variable: DATABASE_URL");
-    }
-
-    #[test]
-    fn test_invalid_config_value_display() {
-        let error = AppError::InvalidConfigValue {
-            key: "port".to_string(),
-            message: "must be a positive integer".to_string(),
-        };
-        assert_eq!(
-            error.to_string(),
-            "Invalid configuration value for 'port': must be a positive integer"
-        );
-    }
-
-    #[test]
     fn test_database_error_display() {
-        let error = AppError::Database("connection pool exhausted".to_string());
-        assert_eq!(error.to_string(), "Database error: connection pool exhausted");
+        let error = DatabaseError::Connection("timeout".to_string());
+        assert_eq!(error.to_string(), "Connection failed: timeout");
     }
 
     #[test]
     fn test_blockchain_error_display() {
-        let error = AppError::Blockchain("RPC node unavailable".to_string());
-        assert_eq!(error.to_string(), "Blockchain error: RPC node unavailable");
+        let error = BlockchainError::InsufficientFunds;
+        assert_eq!(
+            error.to_string(),
+            "Insufficient funds for transaction"
+        );
     }
 
     #[test]
-    fn test_not_found_error_display() {
-        let error = AppError::NotFound("record with id 123".to_string());
-        assert_eq!(error.to_string(), "Record not found: record with id 123");
+    fn test_nested_error_conversion() {
+        let db_error = DatabaseError::NotFound("user 123".to_string());
+        let app_error: AppError = db_error.into();
+
+        assert!(matches!(app_error, AppError::Database(DatabaseError::NotFound(_))));
     }
 
     #[test]
     fn test_validation_error_display() {
-        let error = AppError::InvalidInput {
+        let error = ValidationError::InvalidField {
             field: "email".to_string(),
             message: "invalid format".to_string(),
         };
-        assert_eq!(error.to_string(), "Invalid input: email - invalid format");
+        assert_eq!(error.to_string(), "Invalid field 'email': invalid format");
     }
 
     #[test]
-    fn test_from_env_var_error() {
-        let env_error = std::env::VarError::NotPresent;
-        let app_error: AppError = env_error.into();
-        assert!(matches!(app_error, AppError::MissingEnvVar(_)));
+    fn test_config_error_display() {
+        let error = ConfigError::InvalidValue {
+            key: "port".to_string(),
+            message: "must be positive".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Invalid value for 'port': must be positive"
+        );
     }
 
     #[test]

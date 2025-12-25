@@ -5,4 +5,4 @@
 
 pub mod postgres;
 
-pub use postgres::PostgresDatabase;
+pub use postgres::{PostgresClient, PostgresConfig};

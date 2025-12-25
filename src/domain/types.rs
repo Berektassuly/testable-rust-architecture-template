@@ -1,5 +1,12 @@
+//! Domain types with validation support.
+//!
+//! All request types include validation rules to ensure
+//! data integrity at the API boundary.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use validator::Validate;
 
 /// Represents a unique identifier for domain entities.
 pub type EntityId = String;
@@ -23,6 +30,8 @@ pub struct Item {
 }
 
 impl Item {
+    /// Creates a new Item with the given parameters.
+    #[must_use]
     pub fn new(id: EntityId, hash: HashString, name: String) -> Self {
         let now = Utc::now();
         Self {
@@ -36,11 +45,15 @@ impl Item {
         }
     }
 
+    /// Adds a description to the item.
+    #[must_use]
     pub fn with_description(mut self, description: String) -> Self {
         self.description = Some(description);
         self
     }
 
+    /// Adds metadata to the item.
+    #[must_use]
     pub fn with_metadata(mut self, metadata: ItemMetadata) -> Self {
         self.metadata = Some(metadata);
         self
@@ -48,35 +61,68 @@ impl Item {
 }
 
 /// Additional metadata that can be attached to an item.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ItemMetadata {
     pub author: Option<String>,
     pub version: Option<String>,
     pub tags: Vec<String>,
-    pub custom_fields: std::collections::HashMap<String, String>,
+    pub custom_fields: HashMap<String, String>,
 }
 
-impl Default for ItemMetadata {
-    fn default() -> Self {
-        Self {
-            author: None,
-            version: None,
-            tags: Vec::new(),
-            custom_fields: std::collections::HashMap::new(),
-        }
+impl ItemMetadata {
+    /// Creates new empty metadata.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the author.
+    #[must_use]
+    pub fn with_author(mut self, author: String) -> Self {
+        self.author = Some(author);
+        self
+    }
+
+    /// Sets the version.
+    #[must_use]
+    pub fn with_version(mut self, version: String) -> Self {
+        self.version = Some(version);
+        self
+    }
+
+    /// Adds tags.
+    #[must_use]
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags = tags;
+        self
     }
 }
 
 /// Request payload for creating a new item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Includes validation rules for all fields.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct CreateItemRequest {
+    /// Name of the item (1-255 characters).
+    #[validate(length(min = 1, max = 255, message = "Name must be between 1 and 255 characters"))]
     pub name: String,
+
+    /// Optional description (max 10000 characters).
+    #[validate(length(max = 10000, message = "Description must not exceed 10000 characters"))]
     pub description: Option<String>,
+
+    /// Content of the item (max 1MB).
+    #[validate(length(min = 1, max = 1048576, message = "Content must be between 1 and 1048576 characters"))]
     pub content: String,
-    pub metadata: Option<ItemMetadata>,
+
+    /// Optional metadata with nested validation.
+    #[validate(nested)]
+    pub metadata: Option<ItemMetadataRequest>,
 }
 
 impl CreateItemRequest {
+    /// Creates a new CreateItemRequest with required fields.
+    #[must_use]
     pub fn new(name: String, content: String) -> Self {
         Self {
             name,
@@ -85,14 +131,59 @@ impl CreateItemRequest {
             metadata: None,
         }
     }
+
+    /// Adds a description.
+    #[must_use]
+    pub fn with_description(mut self, description: String) -> Self {
+        self.description = Some(description);
+        self
+    }
+
+    /// Adds metadata.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: ItemMetadataRequest) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+}
+
+/// Validated metadata request.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct ItemMetadataRequest {
+    #[validate(length(max = 255, message = "Author must not exceed 255 characters"))]
+    pub author: Option<String>,
+
+    #[validate(length(max = 50, message = "Version must not exceed 50 characters"))]
+    pub version: Option<String>,
+
+    #[validate(length(max = 20, message = "Maximum 20 tags allowed"))]
+    pub tags: Vec<String>,
+
+    pub custom_fields: HashMap<String, String>,
+}
+
+impl From<ItemMetadataRequest> for ItemMetadata {
+    fn from(req: ItemMetadataRequest) -> Self {
+        Self {
+            author: req.author,
+            version: req.version,
+            tags: req.tags,
+            custom_fields: req.custom_fields,
+        }
+    }
 }
 
 /// Request payload for updating an existing item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct UpdateItemRequest {
+    #[validate(length(min = 1, max = 255, message = "Name must be between 1 and 255 characters"))]
     pub name: Option<String>,
+
+    #[validate(length(max = 10000, message = "Description must not exceed 10000 characters"))]
     pub description: Option<String>,
-    pub metadata: Option<ItemMetadata>,
+
+    #[validate(nested)]
+    pub metadata: Option<ItemMetadataRequest>,
 }
 
 /// Represents a record written to the blockchain.
@@ -106,6 +197,8 @@ pub struct BlockchainRecord {
 }
 
 impl BlockchainRecord {
+    /// Creates a new BlockchainRecord.
+    #[must_use]
     pub fn new(tx_id: TransactionId, hash: HashString) -> Self {
         Self {
             tx_id,
@@ -116,11 +209,15 @@ impl BlockchainRecord {
         }
     }
 
+    /// Sets the block time.
+    #[must_use]
     pub fn with_block_time(mut self, block_time: DateTime<Utc>) -> Self {
         self.block_time = Some(block_time);
         self
     }
 
+    /// Sets the block height.
+    #[must_use]
     pub fn with_block_height(mut self, block_height: u64) -> Self {
         self.block_height = Some(block_height);
         self
@@ -136,6 +233,8 @@ pub struct WriteResult {
 }
 
 impl WriteResult {
+    /// Creates a successful write result.
+    #[must_use]
     pub fn success(record: BlockchainRecord) -> Self {
         Self {
             success: true,
@@ -144,6 +243,8 @@ impl WriteResult {
         }
     }
 
+    /// Creates a failed write result.
+    #[must_use]
     pub fn failure(message: String) -> Self {
         Self {
             success: false,
@@ -161,6 +262,8 @@ pub struct ItemResponse {
 }
 
 impl ItemResponse {
+    /// Creates a new ItemResponse.
+    #[must_use]
     pub fn new(item: Item) -> Self {
         Self {
             item,
@@ -168,6 +271,8 @@ impl ItemResponse {
         }
     }
 
+    /// Adds a blockchain record.
+    #[must_use]
     pub fn with_blockchain_record(mut self, record: BlockchainRecord) -> Self {
         self.blockchain_record = Some(record);
         self
@@ -175,9 +280,12 @@ impl ItemResponse {
 }
 
 /// Pagination parameters for list queries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct PaginationParams {
+    #[validate(range(min = 1, message = "Page must be at least 1"))]
     pub page: u32,
+
+    #[validate(range(min = 1, max = 100, message = "Per page must be between 1 and 100"))]
     pub per_page: u32,
 }
 
@@ -191,8 +299,10 @@ impl Default for PaginationParams {
 }
 
 impl PaginationParams {
+    /// Calculates the offset for database queries.
+    #[must_use]
     pub fn offset(&self) -> u32 {
-        (self.page.saturating_sub(1)) * self.per_page
+        self.page.saturating_sub(1).saturating_mul(self.per_page)
     }
 }
 
@@ -207,6 +317,8 @@ pub struct PaginatedResponse<T> {
 }
 
 impl<T> PaginatedResponse<T> {
+    /// Creates a new paginated response.
+    #[must_use]
     pub fn new(items: Vec<T>, total: u64, params: &PaginationParams) -> Self {
         let total_pages = ((total as f64) / (params.per_page as f64)).ceil() as u32;
         Self {
@@ -220,7 +332,7 @@ impl<T> PaginatedResponse<T> {
 }
 
 /// Health check status for services.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum HealthStatus {
     Healthy,
@@ -235,9 +347,12 @@ pub struct HealthResponse {
     pub database: HealthStatus,
     pub blockchain: HealthStatus,
     pub timestamp: DateTime<Utc>,
+    pub version: String,
 }
 
 impl HealthResponse {
+    /// Creates a new health response based on component statuses.
+    #[must_use]
     pub fn new(database: HealthStatus, blockchain: HealthStatus) -> Self {
         let status = match (&database, &blockchain) {
             (HealthStatus::Healthy, HealthStatus::Healthy) => HealthStatus::Healthy,
@@ -250,6 +365,7 @@ impl HealthResponse {
             database,
             blockchain,
             timestamp: Utc::now(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 }
@@ -257,6 +373,7 @@ impl HealthResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use validator::Validate;
 
     #[test]
     fn test_item_creation() {
@@ -275,12 +392,10 @@ mod tests {
 
     #[test]
     fn test_item_builder_pattern() {
-        let metadata = ItemMetadata {
-            author: Some("Alice".to_string()),
-            version: Some("1.0".to_string()),
-            tags: vec!["test".to_string()],
-            custom_fields: std::collections::HashMap::new(),
-        };
+        let metadata = ItemMetadata::new()
+            .with_author("Alice".to_string())
+            .with_version("1.0".to_string())
+            .with_tags(vec!["test".to_string()]);
 
         let item = Item::new(
             "item-456".to_string(),
@@ -296,35 +411,35 @@ mod tests {
     }
 
     #[test]
-    fn test_blockchain_record_creation() {
-        let record = BlockchainRecord::new(
-            "tx-abc123".to_string(),
-            "hash-xyz".to_string(),
-        )
-        .with_block_height(12345);
+    fn test_create_item_request_validation_success() {
+        let request = CreateItemRequest::new("Valid Name".to_string(), "Valid content".to_string());
 
-        assert_eq!(record.tx_id, "tx-abc123");
-        assert_eq!(record.hash, "hash-xyz");
-        assert_eq!(record.block_height, Some(12345));
-        assert!(record.block_time.is_none());
+        assert!(request.validate().is_ok());
     }
 
     #[test]
-    fn test_write_result_success() {
-        let record = BlockchainRecord::new("tx-123".to_string(), "hash-abc".to_string());
-        let result = WriteResult::success(record);
+    fn test_create_item_request_validation_empty_name() {
+        let request = CreateItemRequest::new("".to_string(), "Valid content".to_string());
 
-        assert!(result.success);
-        assert!(result.record.is_some());
+        let result = request.validate();
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_write_result_failure() {
-        let result = WriteResult::failure("Transaction failed".to_string());
+    fn test_create_item_request_validation_name_too_long() {
+        let long_name = "a".repeat(256);
+        let request = CreateItemRequest::new(long_name, "Valid content".to_string());
 
-        assert!(!result.success);
-        assert!(result.record.is_none());
-        assert_eq!(result.message, "Transaction failed");
+        let result = request.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_item_request_validation_empty_content() {
+        let request = CreateItemRequest::new("Valid Name".to_string(), "".to_string());
+
+        let result = request.validate();
+        assert!(result.is_err());
     }
 
     #[test]
@@ -380,16 +495,32 @@ mod tests {
     }
 
     #[test]
-    fn test_create_item_request() {
-        let request = CreateItemRequest::new(
-            "New Item".to_string(),
-            "Some content here".to_string(),
-        );
+    fn test_blockchain_record_creation() {
+        let record = BlockchainRecord::new("tx-abc123".to_string(), "hash-xyz".to_string())
+            .with_block_height(12345);
 
-        assert_eq!(request.name, "New Item");
-        assert_eq!(request.content, "Some content here");
-        assert!(request.description.is_none());
-        assert!(request.metadata.is_none());
+        assert_eq!(record.tx_id, "tx-abc123");
+        assert_eq!(record.hash, "hash-xyz");
+        assert_eq!(record.block_height, Some(12345));
+        assert!(record.block_time.is_none());
+    }
+
+    #[test]
+    fn test_write_result_success() {
+        let record = BlockchainRecord::new("tx-123".to_string(), "hash-abc".to_string());
+        let result = WriteResult::success(record);
+
+        assert!(result.success);
+        assert!(result.record.is_some());
+    }
+
+    #[test]
+    fn test_write_result_failure() {
+        let result = WriteResult::failure("Transaction failed".to_string());
+
+        assert!(!result.success);
+        assert!(result.record.is_none());
+        assert_eq!(result.message, "Transaction failed");
     }
 
     #[test]

@@ -5,34 +5,64 @@
 //!
 //! # Architecture Overview
 //!
-//! This crate is organized into three main layers:
+//! This crate is organized into four main layers:
 //!
-//! - **Domain Layer** (`domain`): Core traits, types, and error definitions.
-//!   This layer has no dependencies on infrastructure or framework-specific code.
+//! ```text
+//! ┌─────────────────────────────────────────────┐
+//! │                   API Layer                  │
+//! │  HTTP handlers, routing, request validation  │
+//! ├─────────────────────────────────────────────┤
+//! │               Application Layer              │
+//! │    Business logic, service orchestration     │
+//! ├─────────────────────────────────────────────┤
+//! │                 Domain Layer                 │
+//! │   Traits, types, errors (no dependencies)    │
+//! ├─────────────────────────────────────────────┤
+//! │             Infrastructure Layer             │
+//! │  Database adapters, blockchain clients, etc. │
+//! └─────────────────────────────────────────────┘
+//! ```
 //!
-//! - **Application Layer** (`app`): Business logic and shared state management.
-//!   This layer orchestrates operations using trait abstractions from the domain layer.
+//! # Key Features
 //!
-//! - **Infrastructure Layer** (`infra`): Concrete implementations of domain traits.
-//!   This layer contains adapters for databases, blockchains, and external services.
-//!
-//! - **API Layer** (`api`): HTTP handlers and routing using Axum.
+//! - **Trait-based abstraction**: All external dependencies are abstracted behind traits
+//! - **Dependency injection**: Components receive their dependencies through constructors
+//! - **Testability**: Mock implementations enable fast, isolated unit tests
+//! - **Error handling**: Hierarchical error types with proper context preservation
+//! - **Validation**: Input validation using the `validator` crate
+//! - **Logging**: Structured logging with `tracing`
+//! - **Security**: Secret management with `secrecy` crate
 //!
 //! # Example
 //!
 //! ```ignore
-//! use testable_rust_architecture_template::app::{AppState, AppService};
-//! use testable_rust_architecture_template::api::create_router;
 //! use std::sync::Arc;
+//! use testable_rust_architecture_template::api::create_router;
+//! use testable_rust_architecture_template::app::AppState;
+//! use testable_rust_architecture_template::infra::{PostgresClient, RpcBlockchainClient};
 //!
-//! // Create application state with injected dependencies
-//! let state = Arc::new(AppState::new(db_client, blockchain_client));
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     // Create infrastructure clients
+//!     let db = Arc::new(PostgresClient::with_defaults(&database_url).await?);
+//!     let blockchain = Arc::new(RpcBlockchainClient::with_defaults(&rpc_url, signing_key)?);
 //!
-//! // Create router
-//! let router = create_router(state);
+//!     // Create application state
+//!     let state = Arc::new(AppState::new(db, blockchain));
+//!
+//!     // Create and serve the router
+//!     let router = create_router(state);
+//!     axum::serve(listener, router).await?;
+//!
+//!     Ok(())
+//! }
 //! ```
 
 pub mod api;
 pub mod app;
 pub mod domain;
 pub mod infra;
+
+// Test utilities are available in tests
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
