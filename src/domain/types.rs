@@ -33,15 +33,19 @@ impl BlockchainStatus {
             Self::Failed => "failed",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for BlockchainStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "pending" => Some(Self::Pending),
-            "pending_submission" => Some(Self::PendingSubmission),
-            "submitted" => Some(Self::Submitted),
-            "confirmed" => Some(Self::Confirmed),
-            "failed" => Some(Self::Failed),
-            _ => None,
+            "pending" => Ok(Self::Pending),
+            "pending_submission" => Ok(Self::PendingSubmission),
+            "submitted" => Ok(Self::Submitted),
+            "confirmed" => Ok(Self::Confirmed),
+            "failed" => Ok(Self::Failed),
+            _ => Err(format!("Invalid blockchain status: {}", s)),
         }
     }
 }

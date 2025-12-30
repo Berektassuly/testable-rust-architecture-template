@@ -89,7 +89,8 @@ impl PostgresClient {
             description: row.get("description"),
             content: row.get("content"),
             metadata: metadata.and_then(|v| serde_json::from_value(v).ok()),
-            blockchain_status: BlockchainStatus::from_str(&status_str)
+            blockchain_status: status_str
+                .parse()
                 .unwrap_or(BlockchainStatus::Pending),
             blockchain_signature: row.get("blockchain_signature"),
             blockchain_retry_count: row.get("blockchain_retry_count"),

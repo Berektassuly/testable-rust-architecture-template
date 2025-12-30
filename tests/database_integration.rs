@@ -3,7 +3,8 @@
 //! These tests require Docker to be running and use testcontainers
 //! to spin up a real PostgreSQL instance.
 
-use testcontainers::{GenericImage, ImageExt, runners::AsyncRunner};
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::postgres::Postgres;
 
 use std::collections::HashMap;
 use testable_rust_architecture_template::domain::{
@@ -12,12 +13,8 @@ use testable_rust_architecture_template::domain::{
 use testable_rust_architecture_template::infra::{PostgresClient, PostgresConfig};
 
 /// Helper to create a PostgreSQL container and client
-async fn setup_postgres() -> (PostgresClient, testcontainers::ContainerAsync<GenericImage>) {
-    let container = GenericImage::new("postgres", "16-alpine")
-        .with_env_var("POSTGRES_USER", "test")
-        .with_env_var("POSTGRES_PASSWORD", "test")
-        .with_env_var("POSTGRES_DB", "test_db")
-        .with_exposed_port(5432.into())
+async fn setup_postgres() -> (PostgresClient, testcontainers::ContainerAsync<Postgres>) {
+    let container = Postgres::default()
         .start()
         .await
         .expect("Failed to start postgres container");
@@ -27,7 +24,7 @@ async fn setup_postgres() -> (PostgresClient, testcontainers::ContainerAsync<Gen
         .await
         .expect("Failed to get postgres port");
 
-    let database_url = format!("postgres://test:test@127.0.0.1:{}/test_db", port);
+    let database_url = format!("postgres://postgres:postgres@127.0.0.1:{}/postgres", port);
 
     // Wait for postgres to be ready
     let mut attempts = 0;

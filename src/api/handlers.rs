@@ -139,7 +139,7 @@ pub async fn get_item_handler(
         .service
         .get_item(&id)
         .await?
-        .ok_or_else(|| AppError::Database(DatabaseError::NotFound(id)))?;
+        .ok_or(AppError::Database(DatabaseError::NotFound(id)))?;
     Ok(Json(item))
 }
 

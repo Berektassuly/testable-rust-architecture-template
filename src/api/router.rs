@@ -204,10 +204,6 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
     Router::new()
         .nest("/items", items_routes)
         .nest("/health", health_routes)
-        .route(
-            "/api-docs/openapi.json",
-            get(|| async { Json(ApiDoc::openapi()) }),
-        )
         .layer(middleware)
         .with_state(app_state)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
@@ -251,10 +247,6 @@ pub fn create_router_with_rate_limit(app_state: Arc<AppState>, config: RateLimit
     Router::new()
         .nest("/items", items_routes)
         .nest("/health", health_routes)
-        .route(
-            "/api-docs/openapi.json",
-            get(|| async { Json(ApiDoc::openapi()) }),
-        )
         .layer(middleware)
         .with_state(app_state)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
