@@ -208,8 +208,6 @@ impl RpcBlockchainClient {
         memo: &str,
         recent_blockhash: &str,
     ) -> Result<String, AppError> {
-        use sha2::{Digest, Sha256};
-
         // Memo program ID
         let memo_program_id = bs58::decode("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
             .into_vec()
@@ -223,7 +221,10 @@ impl RpcBlockchainClient {
 
         // Build a simplified transaction structure
         // This is a minimal memo transaction
-        let mut tx_data = Vec::new();
+        let mut tx_data = vec![
+            1u8, // sig count
+            2u8, // num accounts
+        ];
 
         // Number of signatures
         tx_data.push(1u8);
@@ -255,7 +256,7 @@ impl RpcBlockchainClient {
         tx_data.extend_from_slice(memo_bytes);
 
         // Sign the message (everything after signatures)
-        let message_start = 1 + 64; // 1 byte for sig count, 64 bytes for signature placeholder
+        let _message_start = 1 + 64; // 1 byte for sig count, 64 bytes for signature placeholder
         let message = &tx_data[1..]; // Skip signature count
         let signature = self.signing_key.sign(message);
 
