@@ -3,4 +3,5 @@
 pub mod handlers;
 pub mod router;
 
-pub use router::{create_router, create_router_with_rate_limit};
+pub use handlers::ApiDoc;
+pub use router::{RateLimitConfig, create_router, create_router_with_rate_limit};

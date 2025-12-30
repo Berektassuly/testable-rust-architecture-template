@@ -6,6 +6,7 @@ use crate::domain::{BlockchainClient, DatabaseClient};
 
 use super::service::AppService;
 
+/// Shared application state
 #[derive(Clone)]
 pub struct AppState {
     pub service: Arc<AppService>,
@@ -14,6 +15,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Create a new application state
     #[must_use]
     pub fn new(
         db_client: Arc<dyn DatabaseClient>,

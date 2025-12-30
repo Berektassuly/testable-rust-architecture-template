@@ -9,5 +9,7 @@ pub use error::{
 };
 pub use traits::{BlockchainClient, DatabaseClient};
 pub use types::{
-    CreateItemRequest, HealthResponse, HealthStatus, Item, ItemMetadata, ItemMetadataRequest,
+    BlockchainStatus, CreateItemRequest, ErrorDetail, ErrorResponse, HealthResponse, HealthStatus,
+    Item, ItemMetadata, ItemMetadataRequest, PaginatedResponse, PaginationParams,
+    RateLimitResponse,
 };

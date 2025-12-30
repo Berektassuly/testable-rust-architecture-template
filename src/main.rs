@@ -12,13 +12,16 @@ use tokio::signal;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use testable_rust_architecture_template::api::{create_router, create_router_with_rate_limit};
-use testable_rust_architecture_template::app::AppState;
+use testable_rust_architecture_template::api::{
+    RateLimitConfig, create_router, create_router_with_rate_limit,
+};
+use testable_rust_architecture_template::app::{AppState, WorkerConfig, spawn_worker};
 use testable_rust_architecture_template::infra::RpcBlockchainClient;
 use testable_rust_architecture_template::infra::{
     PostgresClient, PostgresConfig, signing_key_from_base58,
 };
 
+/// Application configuration
 struct Config {
     database_url: String,
     blockchain_rpc_url: String,
@@ -26,6 +29,9 @@ struct Config {
     host: String,
     port: u16,
     enable_rate_limiting: bool,
+    rate_limit_config: RateLimitConfig,
+    enable_background_worker: bool,
+    worker_config: WorkerConfig,
 }
 
 impl Config {
@@ -42,6 +48,15 @@ impl Config {
         let enable_rate_limiting = env::var("ENABLE_RATE_LIMITING")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
+        let enable_background_worker = env::var("ENABLE_BACKGROUND_WORKER")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(true);
+
+        let rate_limit_config = RateLimitConfig::from_env();
+        let worker_config = WorkerConfig {
+            enabled: enable_background_worker,
+            ..Default::default()
+        };
 
         Ok(Self {
             database_url,
@@ -50,6 +65,9 @@ impl Config {
             host,
             port,
             enable_rate_limiting,
+            rate_limit_config,
+            enable_background_worker,
+            worker_config,
         })
     }
 
@@ -121,23 +139,40 @@ async fn main() -> Result<()> {
 
     info!("📦 Initializing infrastructure...");
 
+    // Initialize database
     let db_config = PostgresConfig::default();
     let postgres_client = PostgresClient::new(&config.database_url, db_config).await?;
     postgres_client.run_migrations().await?;
-    info!("   ✓ Database connected");
+    info!("   ✓ Database connected and migrations applied");
 
+    // Initialize blockchain client
     let blockchain_client =
         RpcBlockchainClient::with_defaults(&config.blockchain_rpc_url, config.signing_key)?;
     info!("   ✓ Blockchain client created");
 
+    // Create application state
     let app_state = Arc::new(AppState::new(
         Arc::new(postgres_client),
         Arc::new(blockchain_client),
     ));
 
-    let router = if config.enable_rate_limiting {
-        create_router_with_rate_limit(app_state)
+    // Start background worker if enabled
+    let worker_shutdown_tx = if config.enable_background_worker {
+        let (_handle, shutdown_tx) =
+            spawn_worker(Arc::clone(&app_state.service), config.worker_config);
+        info!("   ✓ Background worker started");
+        Some(shutdown_tx)
     } else {
+        info!("   ○ Background worker disabled");
+        None
+    };
+
+    // Create router
+    let router = if config.enable_rate_limiting {
+        info!("   ✓ Rate limiting enabled");
+        create_router_with_rate_limit(app_state, config.rate_limit_config)
+    } else {
+        info!("   ○ Rate limiting disabled");
         create_router(app_state)
     };
 
@@ -145,10 +180,17 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     info!("🚀 Server starting on http://{}", addr);
+    info!("📖 Swagger UI available at http://{}/swagger-ui", addr);
+    info!("📄 OpenAPI spec at http://{}/api-docs/openapi.json", addr);
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // Signal worker to shutdown
+    if let Some(tx) = worker_shutdown_tx {
+        let _ = tx.send(true);
+    }
 
     info!("Server shutdown complete");
     Ok(())

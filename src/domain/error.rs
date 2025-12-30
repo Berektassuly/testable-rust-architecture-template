@@ -92,6 +92,8 @@ pub enum AppError {
     Internal(String),
     #[error("Operation not supported: {0}")]
     NotSupported(String),
+    #[error("Rate limit exceeded")]
+    RateLimited,
 }
 
 impl From<serde_json::Error> for AppError {
@@ -119,5 +121,11 @@ impl From<sqlx::Error> for DatabaseError {
             }
             _ => DatabaseError::Query(err.to_string()),
         }
+    }
+}
+
+impl From<sqlx::migrate::MigrateError> for AppError {
+    fn from(err: sqlx::migrate::MigrateError) -> Self {
+        AppError::Database(DatabaseError::Migration(err.to_string()))
     }
 }

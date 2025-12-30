@@ -1,16 +1,17 @@
 //! Mock implementations for testing.
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::domain::{
-    AppError, BlockchainClient, BlockchainError, CreateItemRequest, DatabaseClient, DatabaseError,
-    Item, ItemMetadata,
+    AppError, BlockchainClient, BlockchainError, BlockchainStatus, CreateItemRequest,
+    DatabaseClient, DatabaseError, Item, ItemMetadata, PaginatedResponse,
 };
 
+/// Configuration for mock behavior
 #[derive(Debug, Clone, Default)]
 pub struct MockConfig {
     pub should_fail: bool,
@@ -32,6 +33,7 @@ impl MockConfig {
     }
 }
 
+/// Mock database client for testing
 pub struct MockDatabaseClient {
     storage: Arc<Mutex<HashMap<String, Item>>>,
     config: MockConfig,
@@ -60,6 +62,11 @@ impl MockDatabaseClient {
 
     pub fn set_healthy(&self, healthy: bool) {
         self.is_healthy.store(healthy, Ordering::Relaxed);
+    }
+
+    /// Get all stored items (for testing)
+    pub fn get_all_items(&self) -> Vec<Item> {
+        self.storage.lock().unwrap().values().cloned().collect()
     }
 
     fn check_should_fail(&self) -> Result<(), AppError> {
@@ -113,7 +120,13 @@ impl DatabaseClient for MockDatabaseClient {
             hash: format!("hash_{}", id),
             name: data.name.clone(),
             description: data.description.clone(),
+            content: data.content.clone(),
             metadata,
+            blockchain_status: BlockchainStatus::Pending,
+            blockchain_signature: None,
+            blockchain_retry_count: 0,
+            blockchain_last_error: None,
+            blockchain_next_retry_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -121,8 +134,100 @@ impl DatabaseClient for MockDatabaseClient {
         storage.insert(id, item.clone());
         Ok(item)
     }
+
+    async fn list_items(
+        &self,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<PaginatedResponse<Item>, AppError> {
+        self.check_should_fail()?;
+        let storage = self.storage.lock().unwrap();
+        let mut items: Vec<Item> = storage.values().cloned().collect();
+        items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        // Apply cursor
+        let items = if let Some(cursor_id) = cursor {
+            let pos = items.iter().position(|i| i.id == cursor_id);
+            match pos {
+                Some(p) => items.into_iter().skip(p + 1).collect(),
+                None => {
+                    return Err(AppError::Validation(
+                        crate::domain::ValidationError::InvalidField {
+                            field: "cursor".to_string(),
+                            message: "Invalid cursor".to_string(),
+                        },
+                    ));
+                }
+            }
+        } else {
+            items
+        };
+
+        let limit = limit.clamp(1, 100) as usize;
+        let has_more = items.len() > limit;
+        let items: Vec<Item> = items.into_iter().take(limit).collect();
+        let next_cursor = if has_more {
+            items.last().map(|i| i.id.clone())
+        } else {
+            None
+        };
+
+        Ok(PaginatedResponse::new(items, next_cursor, has_more))
+    }
+
+    async fn update_blockchain_status(
+        &self,
+        id: &str,
+        status: BlockchainStatus,
+        signature: Option<&str>,
+        error: Option<&str>,
+        next_retry_at: Option<DateTime<Utc>>,
+    ) -> Result<(), AppError> {
+        self.check_should_fail()?;
+        let mut storage = self.storage.lock().unwrap();
+        if let Some(item) = storage.get_mut(id) {
+            item.blockchain_status = status;
+            if let Some(sig) = signature {
+                item.blockchain_signature = Some(sig.to_string());
+            }
+            item.blockchain_last_error = error.map(|e| e.to_string());
+            item.blockchain_next_retry_at = next_retry_at;
+            item.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, AppError> {
+        self.check_should_fail()?;
+        let storage = self.storage.lock().unwrap();
+        let now = Utc::now();
+        let mut items: Vec<Item> = storage
+            .values()
+            .filter(|i| {
+                i.blockchain_status == BlockchainStatus::PendingSubmission
+                    && i.blockchain_retry_count < 10
+                    && i.blockchain_next_retry_at.map(|t| t <= now).unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(items.into_iter().take(limit as usize).collect())
+    }
+
+    async fn increment_retry_count(&self, id: &str) -> Result<i32, AppError> {
+        self.check_should_fail()?;
+        let mut storage = self.storage.lock().unwrap();
+        if let Some(item) = storage.get_mut(id) {
+            item.blockchain_retry_count += 1;
+            item.updated_at = Utc::now();
+            Ok(item.blockchain_retry_count)
+        } else {
+            Err(AppError::Database(DatabaseError::NotFound(id.to_string())))
+        }
+    }
 }
 
+/// Mock blockchain client for testing
 pub struct MockBlockchainClient {
     transactions: Arc<Mutex<Vec<String>>>,
     config: MockConfig,
@@ -195,5 +300,31 @@ impl BlockchainClient for MockBlockchainClient {
         let mut transactions = self.transactions.lock().unwrap();
         transactions.push(hash.to_string());
         Ok(signature)
+    }
+
+    async fn get_transaction_status(&self, signature: &str) -> Result<bool, AppError> {
+        self.check_should_fail()?;
+        let transactions = self.transactions.lock().unwrap();
+        Ok(transactions.iter().any(|t| signature.contains(t)))
+    }
+
+    async fn get_block_height(&self) -> Result<u64, AppError> {
+        self.check_should_fail()?;
+        Ok(12345678)
+    }
+
+    async fn get_latest_blockhash(&self) -> Result<String, AppError> {
+        self.check_should_fail()?;
+        Ok("mock_blockhash_abc123".to_string())
+    }
+
+    async fn wait_for_confirmation(
+        &self,
+        signature: &str,
+        _timeout_secs: u64,
+    ) -> Result<bool, AppError> {
+        self.check_should_fail()?;
+        let transactions = self.transactions.lock().unwrap();
+        Ok(transactions.iter().any(|t| signature.contains(t)))
     }
 }

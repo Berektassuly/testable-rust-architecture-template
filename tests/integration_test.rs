@@ -1,4 +1,4 @@
-//! Integration tests.
+//! Integration tests for the API.
 
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ use tower::ServiceExt;
 use testable_rust_architecture_template::api::create_router;
 use testable_rust_architecture_template::app::AppState;
 use testable_rust_architecture_template::domain::{
-    CreateItemRequest, HealthResponse, HealthStatus, Item,
+    BlockchainStatus, CreateItemRequest, HealthResponse, HealthStatus, Item, PaginatedResponse,
 };
 use testable_rust_architecture_template::test_utils::{MockBlockchainClient, MockDatabaseClient};
 
@@ -42,6 +42,7 @@ async fn test_create_item_success() {
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
     let item: Item = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(item.name, "Test Item");
+    assert_eq!(item.blockchain_status, BlockchainStatus::Submitted);
 }
 
 #[tokio::test]
@@ -60,6 +61,156 @@ async fn test_create_item_validation_error() {
 
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_list_items_empty() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/items")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let result: PaginatedResponse<Item> = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(result.items.is_empty());
+    assert!(!result.has_more);
+    assert!(result.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn test_list_items_with_pagination() {
+    let db = Arc::new(MockDatabaseClient::new());
+    let blockchain = Arc::new(MockBlockchainClient::new());
+    let state = Arc::new(AppState::new(
+        Arc::clone(&db) as _,
+        Arc::clone(&blockchain) as _,
+    ));
+
+    // Create some items
+    for i in 0..5 {
+        let payload = CreateItemRequest::new(format!("Item {}", i), "Content".to_string());
+        state
+            .service
+            .create_and_submit_item(&payload)
+            .await
+            .unwrap();
+    }
+
+    let router = create_router(state);
+
+    // Get first page
+    let request = Request::builder()
+        .method("GET")
+        .uri("/items?limit=2")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let result: PaginatedResponse<Item> = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(result.items.len(), 2);
+    assert!(result.has_more);
+    assert!(result.next_cursor.is_some());
+
+    // Get second page
+    let cursor = result.next_cursor.unwrap();
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/items?limit=2&cursor={}", cursor))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let result: PaginatedResponse<Item> = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(result.items.len(), 2);
+    assert!(result.has_more);
+}
+
+#[tokio::test]
+async fn test_get_item_success() {
+    let db = Arc::new(MockDatabaseClient::new());
+    let blockchain = Arc::new(MockBlockchainClient::new());
+    let state = Arc::new(AppState::new(
+        Arc::clone(&db) as _,
+        Arc::clone(&blockchain) as _,
+    ));
+
+    // Create an item
+    let payload = CreateItemRequest::new("Test Item".to_string(), "Content".to_string());
+    let created_item = state
+        .service
+        .create_and_submit_item(&payload)
+        .await
+        .unwrap();
+
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/items/{}", created_item.id))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let item: Item = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(item.id, created_item.id);
+}
+
+#[tokio::test]
+async fn test_get_item_not_found() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/items/nonexistent_id")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_graceful_degradation_blockchain_failure() {
+    let db = Arc::new(MockDatabaseClient::new());
+    let blockchain = Arc::new(MockBlockchainClient::failing("RPC error"));
+    let state = Arc::new(AppState::new(Arc::clone(&db) as _, blockchain));
+    let router = create_router(state);
+
+    let payload = CreateItemRequest::new("Test".to_string(), "Content".to_string());
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/items")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let item: Item = serde_json::from_slice(&body_bytes).unwrap();
+
+    // Item should be created but with pending_submission status
+    assert_eq!(item.blockchain_status, BlockchainStatus::PendingSubmission);
+    assert!(item.blockchain_last_error.is_some());
 }
 
 #[tokio::test]
@@ -150,21 +301,37 @@ async fn test_database_failure() {
 }
 
 #[tokio::test]
-async fn test_blockchain_failure() {
-    let db = Arc::new(MockDatabaseClient::new());
-    let blockchain = Arc::new(MockBlockchainClient::failing("RPC error"));
-    let state = Arc::new(AppState::new(db, blockchain));
+async fn test_swagger_ui_available() {
+    let state = create_test_state();
     let router = create_router(state);
 
-    let payload = CreateItemRequest::new("Test".to_string(), "Content".to_string());
-
     let request = Request::builder()
-        .method("POST")
-        .uri("/items")
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .method("GET")
+        .uri("/swagger-ui/")
+        .body(Body::empty())
         .unwrap();
 
     let response = router.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    // Swagger UI redirects or returns 200
+    assert!(response.status().is_success() || response.status().is_redirection());
+}
+
+#[tokio::test]
+async fn test_openapi_spec_available() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api-docs/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let spec: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(spec.get("openapi").is_some());
+    assert!(spec.get("paths").is_some());
 }
