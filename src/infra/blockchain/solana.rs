@@ -431,7 +431,11 @@ mod tests {
                 .unwrap();
         let pubkey = client.public_key();
         assert!(!pubkey.is_empty());
-        assert_eq!(pubkey.len(), 44); // Base58 encoded 32 bytes
+        // Verify it decodes to 32 bytes (length can be 43 or 44 chars)
+        let decoded = bs58::decode(&pubkey)
+            .into_vec()
+            .expect("Should be valid base58");
+        assert_eq!(decoded.len(), 32);
     }
 
     #[test]
