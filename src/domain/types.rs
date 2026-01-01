@@ -318,3 +318,89 @@ pub struct RateLimitResponse {
     #[schema(example = 60)]
     pub retry_after: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_blockchain_status_display_and_parsing() {
+        let statuses = vec![
+            (BlockchainStatus::Pending, "pending"),
+            (BlockchainStatus::PendingSubmission, "pending_submission"),
+            (BlockchainStatus::Submitted, "submitted"),
+            (BlockchainStatus::Confirmed, "confirmed"),
+            (BlockchainStatus::Failed, "failed"),
+        ];
+
+        for (status, string) in statuses {
+            assert_eq!(status.as_str(), string);
+            assert_eq!(status.to_string(), string);
+            assert_eq!(BlockchainStatus::from_str(string).unwrap(), status);
+        }
+
+        assert!(BlockchainStatus::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_create_item_request_validation() {
+        // Valid request
+        let req = CreateItemRequest::new("Valid Name".to_string(), "Valid Content".to_string());
+        assert!(req.validate().is_ok());
+
+        // Invalid Name (empty)
+        let req = CreateItemRequest::new("".to_string(), "Content".to_string());
+        assert!(req.validate().is_err());
+
+        // Invalid Name (too long)
+        let name = "a".repeat(256);
+        let req = CreateItemRequest::new(name, "Content".to_string());
+        assert!(req.validate().is_err());
+
+        // Invalid Content (empty)
+        let req = CreateItemRequest::new("Name".to_string(), "".to_string());
+        assert!(req.validate().is_err());
+
+        // Invalid Content (too long)
+        let content = "a".repeat(1_048_577);
+        let req = CreateItemRequest::new("Name".to_string(), content);
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_pagination_params_validation() {
+        // Valid
+        let params = PaginationParams {
+            limit: 20,
+            cursor: None,
+        };
+        assert!(params.validate().is_ok());
+
+        // Invalid limit (too small)
+        let params = PaginationParams {
+            limit: 0,
+            cursor: None,
+        };
+        assert!(params.validate().is_err());
+
+        // Invalid limit (too large)
+        let params = PaginationParams {
+            limit: 101,
+            cursor: None,
+        };
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn test_health_response_logic() {
+        let healthy = HealthResponse::new(HealthStatus::Healthy, HealthStatus::Healthy);
+        assert_eq!(healthy.status, HealthStatus::Healthy);
+
+        let degraded = HealthResponse::new(HealthStatus::Healthy, HealthStatus::Unhealthy);
+        assert_eq!(degraded.status, HealthStatus::Unhealthy);
+
+        // Ensure version is present
+        assert!(!healthy.version.is_empty());
+    }
+}

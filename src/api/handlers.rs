@@ -335,3 +335,59 @@ impl IntoResponse for AppError {
         (status, body).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::DatabaseClient;
+    use crate::test_utils::{MockBlockchainClient, MockDatabaseClient};
+
+    #[tokio::test]
+    async fn test_create_item_handler() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+        let state = Arc::new(AppState::new(db, bc));
+
+        let payload = CreateItemRequest {
+            name: "Test Item".to_string(),
+            description: Some("Desc".to_string()),
+            content: "Content".to_string(),
+            metadata: None,
+        };
+
+        let result = create_item_handler(State(state), Json(payload)).await;
+        assert!(result.is_ok());
+        let Json(item) = result.unwrap();
+        assert_eq!(item.name, "Test Item");
+        assert_eq!(
+            item.blockchain_status,
+            crate::domain::BlockchainStatus::Submitted
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_item_handler() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+        let state = Arc::new(AppState::new(db.clone(), bc));
+
+        // Seed item
+        let req = CreateItemRequest::new("Seed".to_string(), "Content".to_string());
+        let created = db.create_item(&req).await.unwrap();
+
+        let result = get_item_handler(State(state), Path(created.id.clone())).await;
+        assert!(result.is_ok());
+        let Json(fetched) = result.unwrap();
+        assert_eq!(fetched.id, created.id);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_handler() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+        let state = Arc::new(AppState::new(db, bc));
+
+        let Json(resp) = health_check_handler(State(state)).await;
+        assert_eq!(resp.status, HealthStatus::Healthy);
+    }
+}

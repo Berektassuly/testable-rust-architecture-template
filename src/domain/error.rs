@@ -129,3 +129,41 @@ impl From<sqlx::migrate::MigrateError> for AppError {
         AppError::Database(DatabaseError::Migration(err.to_string()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_database_error_conversions() {
+        let not_found = DatabaseError::from(sqlx::Error::RowNotFound);
+        assert!(matches!(not_found, DatabaseError::NotFound(_)));
+
+        // Simulate duplicate key error check (requires constructing a specific sqlx error which is hard,
+        // so we check the fallback)
+        let generic = DatabaseError::from(sqlx::Error::WorkerCrashed);
+        assert!(matches!(generic, DatabaseError::Query(_)));
+    }
+
+    #[test]
+    fn test_validation_conversion() {
+        use validator::Validate;
+
+        #[derive(Validate)]
+        struct TestStruct {
+            #[validate(length(min = 1))]
+            val: String,
+        }
+
+        let s = TestStruct {
+            val: "".to_string(),
+        };
+        let err = s.validate().unwrap_err();
+        let app_err = AppError::from(err);
+
+        assert!(matches!(
+            app_err,
+            AppError::Validation(ValidationError::Multiple(_))
+        ));
+    }
+}
