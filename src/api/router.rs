@@ -251,3 +251,175 @@ pub fn create_router_with_rate_limit(app_state: Arc<AppState>, config: RateLimit
         .with_state(app_state)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+        middleware,
+        response::IntoResponse,
+        routing::get,
+    };
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    mod test_utils {
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+
+        use crate::app::AppState;
+        use crate::domain::{
+            AppError, BlockchainClient, BlockchainStatus, CreateItemRequest, DatabaseClient, Item,
+            PaginatedResponse,
+        };
+
+        #[derive(Clone)]
+        pub struct MockDatabaseClient;
+
+        #[async_trait]
+        impl DatabaseClient for MockDatabaseClient {
+            async fn health_check(&self) -> Result<(), AppError> {
+                Ok(())
+            }
+
+            async fn get_item(&self, _id: &str) -> Result<Option<Item>, AppError> {
+                Ok(None)
+            }
+
+            async fn create_item(&self, _data: &CreateItemRequest) -> Result<Item, AppError> {
+                unimplemented!()
+            }
+
+            async fn list_items(
+                &self,
+                _limit: i64,
+                _cursor: Option<&str>,
+            ) -> Result<PaginatedResponse<Item>, AppError> {
+                unimplemented!()
+            }
+
+            async fn update_blockchain_status(
+                &self,
+                _id: &str,
+                _status: BlockchainStatus,
+                _signature: Option<&str>,
+                _error: Option<&str>,
+                _next_retry_at: Option<DateTime<Utc>>,
+            ) -> Result<(), AppError> {
+                Ok(())
+            }
+
+            async fn get_pending_blockchain_items(
+                &self,
+                _limit: i64,
+            ) -> Result<Vec<Item>, AppError> {
+                Ok(vec![])
+            }
+
+            async fn increment_retry_count(&self, _id: &str) -> Result<i32, AppError> {
+                Ok(0)
+            }
+        }
+
+        #[derive(Clone)]
+        pub struct MockBlockchainClient;
+
+        #[async_trait]
+        impl BlockchainClient for MockBlockchainClient {
+            async fn health_check(&self) -> Result<(), AppError> {
+                Ok(())
+            }
+
+            async fn submit_transaction(&self, _hash: &str) -> Result<String, AppError> {
+                Ok("tx".into())
+            }
+        }
+
+        impl AppState {
+            pub fn new_for_test() -> Arc<Self> {
+                let db = Arc::new(MockDatabaseClient);
+                let bc = Arc::new(MockBlockchainClient);
+                Arc::new(AppState::new(db, bc))
+            }
+        }
+    }
+
+    mod rate_limit_config_tests {
+        use super::*;
+
+        #[test]
+        fn test_rate_limit_config_default() {
+            let config = RateLimitConfig::default();
+            assert_eq!(config.general_rps, 10);
+            assert_eq!(config.general_burst, 20);
+        }
+    }
+
+    mod middleware_tests {
+        use super::*;
+
+        async fn dummy_handler() -> impl IntoResponse {
+            StatusCode::OK
+        }
+
+        #[tokio::test]
+        async fn test_rate_limit_items_middleware_blocks_request() {
+            let config = RateLimitConfig {
+                general_rps: 1,
+                general_burst: 1,
+                ..Default::default()
+            };
+
+            let state = Arc::new(RateLimitState::new(config));
+
+            let app =
+                Router::new()
+                    .route("/", get(dummy_handler))
+                    .layer(middleware::from_fn_with_state(
+                        state,
+                        rate_limit_items_middleware,
+                    ));
+
+            app.clone()
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            let response = app
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
+    mod router_tests {
+        use super::*;
+        use crate::app::AppState; // ← ВОТ ТУТ ГЛАВНЫЙ ФИКС
+
+        #[tokio::test]
+        async fn test_router_without_rate_limit_routes() {
+            let app_state = AppState::new_for_test();
+            let router = create_router(app_state);
+
+            let res = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/health/live")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+    }
+}
