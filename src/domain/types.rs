@@ -414,4 +414,134 @@ mod tests {
         // Ensure version is present
         assert!(!healthy.version.is_empty());
     }
+    #[test]
+    fn test_item_initialization_defaults() {
+        let item = Item::new(
+            "id_123".to_string(),
+            "hash_abc".to_string(),
+            "Name".to_string(),
+            "Content".to_string(),
+        );
+
+        assert_eq!(item.blockchain_status, BlockchainStatus::Pending);
+        assert!(item.blockchain_signature.is_none());
+        assert_eq!(item.blockchain_retry_count, 0);
+        assert!(item.blockchain_last_error.is_none());
+        assert!(item.blockchain_next_retry_at.is_none());
+        assert!(item.metadata.is_none());
+        assert!(item.description.is_none());
+    }
+
+    #[test]
+    fn test_item_default_impl() {
+        let item = Item::default();
+        assert_eq!(item.id, "default_id");
+        assert_eq!(item.blockchain_status, BlockchainStatus::Pending);
+    }
+
+    #[test]
+    fn test_create_item_request_description_validation() {
+        // Valid description
+        let mut req = CreateItemRequest::new("Name".to_string(), "Content".to_string());
+        req.description = Some("Valid description".to_string());
+        assert!(req.validate().is_ok());
+
+        // Invalid description (too long)
+        let long_desc = "a".repeat(10001);
+        req.description = Some(long_desc);
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_metadata_request_nested_validation() {
+        // Prepare base valid request
+        let mut req = CreateItemRequest::new("Name".to_string(), "Content".to_string());
+
+        // Case 1: Invalid Author Length
+        let invalid_metadata_author = ItemMetadataRequest {
+            author: Some("a".repeat(256)),
+            version: Some("1.0".to_string()),
+            tags: vec![],
+            custom_fields: HashMap::new(),
+        };
+        req.metadata = Some(invalid_metadata_author);
+        assert!(req.validate().is_err());
+
+        // Reset
+        let mut req = CreateItemRequest::new("Name".to_string(), "Content".to_string());
+
+        // Case 2: Invalid Version Length
+        let invalid_metadata_version = ItemMetadataRequest {
+            author: Some("Author".to_string()),
+            version: Some("v".repeat(51)),
+            tags: vec![],
+            custom_fields: HashMap::new(),
+        };
+        req.metadata = Some(invalid_metadata_version);
+        assert!(req.validate().is_err());
+
+        // Reset
+        let mut req = CreateItemRequest::new("Name".to_string(), "Content".to_string());
+
+        // Case 3: Too many tags
+        let tags: Vec<String> = (0..21).map(|i| i.to_string()).collect();
+        let invalid_metadata_tags = ItemMetadataRequest {
+            author: None,
+            version: None,
+            tags,
+            custom_fields: HashMap::new(),
+        };
+        req.metadata = Some(invalid_metadata_tags);
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_pagination_params_default() {
+        let params = PaginationParams::default();
+        assert_eq!(params.limit, 20);
+        assert!(params.cursor.is_none());
+    }
+
+    #[test]
+    fn test_paginated_response_constructors() {
+        // Test empty
+        let empty: PaginatedResponse<Item> = PaginatedResponse::empty();
+        assert!(empty.items.is_empty());
+        assert!(empty.next_cursor.is_none());
+        assert!(!empty.has_more);
+
+        // Test explicit new
+        let items = vec![Item::default()];
+        let response = PaginatedResponse::new(items.clone(), Some("cursor".to_string()), true);
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.next_cursor, Some("cursor".to_string()));
+        assert!(response.has_more);
+    }
+
+    #[test]
+    fn test_health_response_status_combinations() {
+        // Healthy + Degraded = Degraded
+        let res = HealthResponse::new(HealthStatus::Healthy, HealthStatus::Degraded);
+        assert_eq!(res.status, HealthStatus::Degraded);
+
+        // Degraded + Healthy = Degraded
+        let res = HealthResponse::new(HealthStatus::Degraded, HealthStatus::Healthy);
+        assert_eq!(res.status, HealthStatus::Degraded);
+
+        // Degraded + Degraded = Degraded
+        let res = HealthResponse::new(HealthStatus::Degraded, HealthStatus::Degraded);
+        assert_eq!(res.status, HealthStatus::Degraded);
+
+        // Unhealthy + Degraded = Unhealthy (Unhealthy takes precedence)
+        let res = HealthResponse::new(HealthStatus::Unhealthy, HealthStatus::Degraded);
+        assert_eq!(res.status, HealthStatus::Unhealthy);
+
+        // Degraded + Unhealthy = Unhealthy (Unhealthy takes precedence)
+        let res = HealthResponse::new(HealthStatus::Degraded, HealthStatus::Unhealthy);
+        assert_eq!(res.status, HealthStatus::Unhealthy);
+
+        // Unhealthy + Healthy = Unhealthy
+        let res = HealthResponse::new(HealthStatus::Unhealthy, HealthStatus::Healthy);
+        assert_eq!(res.status, HealthStatus::Unhealthy);
+    }
 }
