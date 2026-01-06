@@ -390,4 +390,161 @@ mod tests {
         let Json(resp) = health_check_handler(State(state)).await;
         assert_eq!(resp.status, HealthStatus::Healthy);
     }
+    #[tokio::test]
+    async fn test_list_items_handler_pagination_clamping() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+        let state = Arc::new(AppState::new(db, bc));
+
+        // Test with limit > 100
+        let params_high = PaginationParams {
+            limit: i64::MAX,
+            cursor: None,
+        };
+        let result = list_items_handler(State(state.clone()), Query(params_high)).await;
+        assert!(result.is_ok());
+        // Note: We can't verify the internal call argument without a spy,
+        // but we ensure the handler doesn't panic and returns success.
+
+        // Test with limit < 1
+        let params_low = PaginationParams {
+            limit: i64::MIN,
+            cursor: None,
+        };
+        let result_low = list_items_handler(State(state), Query(params_low)).await;
+        assert!(result_low.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_item_handler_not_found() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+        let state = Arc::new(AppState::new(db, bc));
+
+        let result = get_item_handler(State(state), Path("non-existent-id".to_string())).await;
+
+        match result {
+            Err(AppError::Database(DatabaseError::NotFound(id))) => {
+                assert_eq!(id, "non-existent-id");
+            }
+            _ => panic!("Expected DatabaseError::NotFound"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retry_blockchain_handler_success() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+        let state = Arc::new(AppState::new(db.clone(), bc));
+
+        // Seed item
+        let req = CreateItemRequest::new("Retry Item".to_string(), "Content".to_string());
+        let created = db.create_item(&req).await.unwrap();
+
+        // Update status to be eligible for retry
+        db.update_blockchain_status(
+            &created.id,
+            crate::domain::BlockchainStatus::PendingSubmission,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = retry_blockchain_handler(State(state), Path(created.id)).await;
+        assert!(result.is_ok());
+        let Json(item) = result.unwrap();
+        assert_eq!(item.name, "Retry Item");
+    }
+
+    #[tokio::test]
+    async fn test_liveness_handler() {
+        let status = liveness_handler().await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_readiness_handler_healthy() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+        let state = Arc::new(AppState::new(db, bc));
+
+        let status = readiness_handler(State(state)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // --- Error Mapping Tests (IntoResponse) ---
+
+    #[test]
+    fn test_error_mapping_database_not_found() {
+        let err = AppError::Database(DatabaseError::NotFound("123".into()));
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_error_mapping_database_conflict() {
+        let err = AppError::Database(DatabaseError::Duplicate("key".into()));
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn test_error_mapping_blockchain_insufficient_funds() {
+        let err = AppError::Blockchain(BlockchainError::InsufficientFunds);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[test]
+    fn test_error_mapping_blockchain_timeout() {
+        let err = AppError::Blockchain(BlockchainError::Timeout("5000ms".into()));
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[test]
+    fn test_error_mapping_external_service_rate_limited() {
+        let err = AppError::ExternalService(ExternalServiceError::RateLimited("provider".into()));
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn test_error_mapping_validation_error() {
+        let err = AppError::Validation("Invalid email format".into());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_error_mapping_auth_errors() {
+        let err_unauth = AppError::Authentication("Missing token".into());
+        assert_eq!(
+            err_unauth.into_response().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let err_forbidden = AppError::Authorization("Insufficient permissions".into());
+        assert_eq!(
+            err_forbidden.into_response().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn test_error_mapping_internal_errors() {
+        let err_internal = AppError::Internal("Unexpected failure".into());
+        assert_eq!(
+            err_internal.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let err_config = AppError::Config("Missing env var".into());
+        assert_eq!(
+            err_config.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 }

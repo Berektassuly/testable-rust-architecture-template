@@ -44,6 +44,12 @@ pub enum ConfigError {
     ParseError(String),
 }
 
+impl From<&str> for ConfigError {
+    fn from(s: &str) -> Self {
+        ConfigError::ParseError(s.to_string())
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum ValidationError {
     #[error("Invalid field '{field}': {message}")]
@@ -54,6 +60,12 @@ pub enum ValidationError {
     InvalidFormat(String),
     #[error("Validation failed: {0}")]
     Multiple(String),
+}
+
+impl From<&str> for ValidationError {
+    fn from(s: &str) -> Self {
+        ValidationError::InvalidFormat(s.to_string())
+    }
 }
 
 #[derive(Error, Debug)]
