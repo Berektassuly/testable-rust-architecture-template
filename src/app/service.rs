@@ -472,7 +472,15 @@ mod service_tests {
     #[tokio::test]
     async fn test_retry_submission_invalid_state() {
         let mut valid_item = Item::default();
-        valid_item.id = "valid_id".to_string();
+
+        let _item = Item {
+            id: "retry_id".to_string(),
+            blockchain_status: BlockchainStatus::PendingSubmission,
+            name: "Test".to_string(),
+            content: "Content".to_string(),
+            ..Default::default()
+        };
+
         valid_item.blockchain_status = BlockchainStatus::Submitted; // Already submitted
 
         let db = Arc::new(ScenarioDatabaseClient {
@@ -496,11 +504,13 @@ mod service_tests {
     #[tokio::test]
     async fn test_retry_submission_max_retries_reached() {
         // Prepare item in DB
-        let mut item = Item::default();
-        item.id = "retry_id".to_string();
-        item.blockchain_status = BlockchainStatus::PendingSubmission;
-        item.name = "Test".to_string();
-        item.content = "Content".to_string();
+        let item = Item {
+            id: "retry_id".to_string(),
+            name: "Test".to_string(),
+            content: "Content".to_string(),
+            blockchain_status: BlockchainStatus::PendingSubmission,
+            ..Default::default()
+        };
 
         let db = Arc::new(ScenarioDatabaseClient {
             items: Mutex::new(vec![item.clone()]),
@@ -530,11 +540,13 @@ mod service_tests {
     #[tokio::test]
     async fn test_retry_submission_backoff_calculation() {
         // Prepare item
-        let mut item = Item::default();
-        item.id = "backoff_id".to_string();
-        item.blockchain_status = BlockchainStatus::PendingSubmission;
-        item.name = "Test".to_string();
-        item.content = "Content".to_string();
+        let item = Item {
+            id: "backoff_id".to_string(),
+            name: "Test".to_string(),
+            content: "Content".to_string(),
+            blockchain_status: BlockchainStatus::PendingSubmission,
+            ..Default::default()
+        };
 
         let db = Arc::new(ScenarioDatabaseClient {
             items: Mutex::new(vec![item.clone()]),
@@ -567,17 +579,21 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_process_pending_submissions_batch() {
-        let mut item1 = Item::default();
-        item1.id = "1".to_string();
-        item1.name = "1".to_string();
-        item1.content = "c".to_string();
-        item1.blockchain_status = BlockchainStatus::PendingSubmission;
+        let item1 = Item {
+            id: "1".to_string(),
+            name: "1".to_string(),
+            content: "c".to_string(),
+            blockchain_status: BlockchainStatus::PendingSubmission,
+            ..Default::default()
+        };
 
-        let mut item2 = Item::default();
-        item2.id = "2".to_string();
-        item2.name = "2".to_string();
-        item2.content = "c".to_string();
-        item2.blockchain_status = BlockchainStatus::PendingSubmission;
+        let item2 = Item {
+            id: "2".to_string(),
+            name: "2".to_string(),
+            content: "c".to_string(),
+            blockchain_status: BlockchainStatus::PendingSubmission,
+            ..Default::default()
+        };
 
         let db = Arc::new(ScenarioDatabaseClient {
             items: Mutex::new(vec![item1, item2]),
