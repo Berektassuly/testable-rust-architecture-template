@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum DatabaseError {
     #[error("Connection failed: {0}")]
     Connection(String),
@@ -18,7 +18,7 @@ pub enum DatabaseError {
     Migration(String),
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum BlockchainError {
     #[error("Connection failed: {0}")]
     Connection(String),

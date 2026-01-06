@@ -115,6 +115,17 @@ impl Item {
     }
 }
 
+impl Default for Item {
+    fn default() -> Self {
+        Self::new(
+            "default_id".to_string(),
+            "default_hash".to_string(),
+            "default_name".to_string(),
+            "default_content".to_string(),
+        )
+    }
+}
+
 /// Item metadata
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, ToSchema)]
 pub struct ItemMetadata {
