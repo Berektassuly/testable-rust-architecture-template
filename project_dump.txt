@@ -1,0 +1,4835 @@
+
+===== ./.cargo/audit.toml =====
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
+===== ./.cargo/config.toml =====
+[build]
+# Use all available CPU cores for compilation
+jobs = -1
+
+[target.x86_64-unknown-linux-gnu]
+# Use mold linker if available (faster linking)
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[alias]
+# Useful aliases
+t = "test"
+c = "check"
+b = "build"
+r = "run"
+br = "build --release"
+rr = "run --release"
+lint = "clippy -- -D warnings"
+fmt-check = "fmt --check"
+
+[env]
+# Default environment for development
+RUST_BACKTRACE = "1"
+
+===== ./.env =====
+# ============================================================================
+# ENVIRONMENT CONFIGURATION TEMPLATE
+# ============================================================================
+#
+# This file serves as a template for your local environment configuration.
+#
+# SETUP INSTRUCTIONS:
+# 1. Copy this file to `.env` in the project root: cp .env.example .env
+# 2. Fill in the actual values for your local development environment
+# 3. NEVER commit the `.env` file to version control
+#
+# The `.env` file is already included in .gitignore for your protection.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# DATABASE CONFIGURATION
+# ----------------------------------------------------------------------------
+
+# PostgreSQL connection string
+# Format: postgres://USERNAME:PASSWORD@HOST:PORT/DATABASE_NAME
+#
+# For local development, you might use:
+#   - Docker: postgres://postgres:postgres@localhost:5432/app_dev
+#   - Native install: postgres://your_user:your_password@localhost:5432/your_db
+#
+# Make sure the database exists before running the application:
+#   createdb -U postgres app_dev
+#
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/app_dev
+
+# ----------------------------------------------------------------------------
+# BLOCKCHAIN CONFIGURATION
+# ----------------------------------------------------------------------------
+
+# Solana RPC endpoint URL
+# This can be a public endpoint or a local validator
+#
+# Available public endpoints:
+#   - Devnet:  https://api.devnet.solana.com
+#   - Testnet: https://api.testnet.solana.com
+#   - Mainnet: https://api.mainnet-beta.solana.com (NOT recommended for dev)
+#
+# For local development with solana-test-validator:
+#   - Local:   http://127.0.0.1:8899
+#
+SOLANA_RPC_URL=https://api.devnet.solana.com
+
+# Issuer private key (Base58-encoded)
+# This keypair is used to sign transactions on the blockchain.
+#
+# !!! SECURITY WARNING !!!
+# - NEVER use a mainnet keypair with real funds for development
+# - NEVER commit real private keys to version control
+# - Use a dedicated development keypair with devnet/testnet SOL only
+#
+# To generate a new development keypair using the Solana CLI:
+#
+#   solana-keygen new --outfile ~/.config/solana/dev-keypair.json --no-bip39-passphrase
+#
+# To get the Base58-encoded private key from the generated file:
+#
+#   cat ~/.config/solana/dev-keypair.json
+#
+# The output is a JSON array of bytes. You can convert it to Base58 using:
+#
+#   solana-keygen pubkey ~/.config/solana/dev-keypair.json  # Shows public key
+#   # Use a script or online tool to convert the byte array to Base58
+#
+# Alternatively, you can use the keypair file path directly in your code
+# instead of a Base58 string (requires code modification).
+#
+# To fund your devnet keypair with test SOL:
+#
+#   solana airdrop 2 <YOUR_PUBLIC_KEY> --url https://api.devnet.solana.com
+#
+ISSUER_PRIVATE_KEY="YOUR_BASE58_ENCODED_PRIVATE_KEY_HERE"
+
+# ----------------------------------------------------------------------------
+# APPLICATION CONFIGURATION (Optional)
+# ----------------------------------------------------------------------------
+
+# Server host and port (defaults shown)
+# HOST=0.0.0.0
+# PORT=3000
+
+# Logging level: trace, debug, info, warn, error
+# RUST_LOG=info
+===== ./.env.example =====
+# Database Configuration
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/app_dev
+
+# Blockchain Configuration
+SOLANA_RPC_URL=https://api.devnet.solana.com
+ISSUER_PRIVATE_KEY=YOUR_BASE58_ENCODED_PRIVATE_KEY_HERE
+
+# Server Configuration
+HOST=0.0.0.0
+PORT=3000
+
+# Rate Limiting Configuration
+ENABLE_RATE_LIMITING=false
+RATE_LIMIT_RPS=10
+RATE_LIMIT_BURST=20
+
+# Background Worker Configuration
+ENABLE_BACKGROUND_WORKER=true
+
+# Logging Configuration
+RUST_LOG=info,tower_http=debug,sqlx=warn
+
+===== ./.github/workflows/ci.yml =====
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  DATABASE_URL: postgres://postgres:postgres@localhost:5432/test_db
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup component add clippy
+      - run: cargo clippy --all-targets --all-features
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features --lib --bins
+
+  # Migration checks
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features postgres
+      - name: Check migrations
+        run: sqlx migrate info --source ./migrations
+      - name: Run migrations
+        run: sqlx migrate run --source ./migrations
+
+  # Integration tests with real PostgreSQL
+  integration-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Run integration tests
+        run: cargo test --all-features --test integration_test
+      
+  # Database integration tests with testcontainers
+  database-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Run database integration tests
+        run: cargo test --all-features --test database_integration -- --test-threads=1
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+
+  # Build with real-blockchain feature
+  build-real-blockchain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --features real-blockchain
+
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  coverage:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+      - name: Generate code coverage
+        run: |
+          cargo tarpaulin --verbose --all-features --workspace --timeout 120 --out Xml
+      - name: Upload to codecov.io
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
+
+  # Documentation generation
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: Swatinem/rust-cache@v2
+      - name: Build documentation
+        run: cargo doc --no-deps --all-features
+
+  # Benchmark compilation check
+  bench-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Check benchmarks
+        run: cargo check --bench domain_benchmarks
+
+===== ./.gitignore =====
+/target/
+.env
+.env.local
+.DS_Store
+*.log
+
+===== ./benches/domain_benchmarks.rs =====
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use sha2::{Digest, Sha256};
+use testable_rust_architecture_template::domain::CreateItemRequest;
+use validator::Validate;
+
+fn bench_validation(c: &mut Criterion) {
+    let request = CreateItemRequest::new(
+        "Standard Item Name".to_string(),
+        "This is some content that is being validated. It's a standard size content string."
+            .to_string(),
+    );
+
+    c.bench_function("validate_create_item_request", |b| {
+        b.iter(|| {
+            let _ = black_box(&request).validate();
+        })
+    });
+}
+
+fn bench_hashing(c: &mut Criterion) {
+    let data = "Some reasonably long content string that we want to hash using SHA256 to simulate the hashing done in the service layer.".repeat(10);
+
+    c.bench_function("sha256_hashing", |b| {
+        b.iter(|| {
+            let mut hasher = Sha256::new();
+            hasher.update(black_box(&data).as_bytes());
+            let _ = hasher.finalize();
+        })
+    });
+}
+
+criterion_group!(benches, bench_validation, bench_hashing);
+criterion_main!(benches);
+
+===== ./Cargo.toml =====
+[package]
+name = "testable-rust-architecture-template"
+version = "0.3.0"
+edition = "2024"
+description = "A production-ready Rust template demonstrating testable architecture"
+license = "MIT"
+
+[features]
+default = []
+test-utils = []
+real-blockchain = []
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1.48", features = ["full", "signal"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "chrono",
+    "uuid",
+    "migrate",
+    "macros",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+async-trait = "0.1"
+dotenvy = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tower = { version = "0.5", features = ["util", "timeout", "limit"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "limit"] }
+bs58 = "0.5"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+sha2 = "0.10"
+validator = { version = "0.19", features = ["derive"] }
+secrecy = { version = "0.10", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# OpenAPI documentation
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
+# Rate limiting  
+governor = "0.8"
+
+[dev-dependencies]
+testable-rust-architecture-template = { path = ".", features = ["test-utils"] }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tokio-test = "0.4"
+testcontainers = "0.26"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "domain_benchmarks"
+harness = false
+
+
+[lib]
+name = "testable_rust_architecture_template"
+path = "src/lib.rs"
+===== ./LICENSE =====
+MIT License
+
+Copyright (c) 2024 Testable Rust Architecture Template
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+===== ./migrations/20240101000000_create_items_table.sql =====
+-- Create items table with proper indexing
+CREATE TABLE IF NOT EXISTS items (
+    id VARCHAR(255) PRIMARY KEY,
+    hash VARCHAR(255) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    content TEXT NOT NULL,
+    metadata JSONB,
+    blockchain_status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    blockchain_signature VARCHAR(255),
+    blockchain_retry_count INTEGER NOT NULL DEFAULT 0,
+    blockchain_last_error TEXT,
+    blockchain_next_retry_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Indexes for frequently accessed fields
+CREATE INDEX IF NOT EXISTS idx_items_created_at ON items(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_items_name ON items(name);
+CREATE INDEX IF NOT EXISTS idx_items_hash ON items(hash);
+CREATE INDEX IF NOT EXISTS idx_items_blockchain_status ON items(blockchain_status);
+CREATE INDEX IF NOT EXISTS idx_items_blockchain_next_retry ON items(blockchain_next_retry_at) 
+    WHERE blockchain_status = 'pending_submission';
+
+-- GIN index for JSONB metadata queries
+CREATE INDEX IF NOT EXISTS idx_items_metadata ON items USING GIN (metadata);
+
+-- Comment on table
+COMMENT ON TABLE items IS 'Core items table with blockchain integration support';
+COMMENT ON COLUMN items.blockchain_status IS 'Status: pending, pending_submission, submitted, confirmed, failed';
+
+===== ./project_dump.txt =====
+
+===== ./README.md =====
+# 🏗️ Testable Rust Architecture Template
+
+[![CI](https://github.com/Berektassuly/testable-rust-architecture-template/actions/workflows/ci.yml/badge.svg)](https://github.com/Berektassuly/testable-rust-architecture-template/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+Production-ready Rust template demonstrating testable architecture through trait-based abstraction and dependency injection.
+
+## ✨ Features
+
+- **🧱 Clean Architecture** — Layered design with clear separation of concerns
+- **💉 Dependency Injection** — Trait-based abstractions for testability
+- **🔒 Security** — Input validation, secret management
+- **⚡ Performance** — Connection pooling, async throughout
+- **🧪 Testing** — Unit tests, integration tests, mock utilities
+- **📊 Observability** — Structured logging, health checks
+- **🚀 Production Ready** — Graceful shutdown, proper error handling
+
+## 📁 Project Structure
+
+```
+src/
+├── api/                    # HTTP layer
+│   ├── handlers.rs         # Request handlers
+│   └── router.rs           # Routes & middleware
+├── app/                    # Application layer
+│   ├── service.rs          # Business logic
+│   └── state.rs            # Shared state
+├── domain/                 # Domain layer
+│   ├── error.rs            # Error types
+│   ├── traits.rs           # Contracts
+│   └── types.rs            # Models + validation
+├── infra/                  # Infrastructure
+│   ├── database/           # PostgreSQL
+│   └── blockchain/         # RPC client
+└── test_utils/             # Mocks
+```
+
+## 🏛️ Architecture
+
+```
+┌─────────────────────────────────────────┐
+│              API Layer                  │
+│   HTTP handlers, routing, validation    │
+├─────────────────────────────────────────┤
+│           Application Layer             │
+│    Business logic, orchestration        │
+├─────────────────────────────────────────┤
+│             Domain Layer                │
+│     Traits, types, errors (pure Rust)   │
+├─────────────────────────────────────────┤
+│          Infrastructure Layer           │
+│   Database, blockchain, external APIs   │
+└─────────────────────────────────────────┘
+```
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+- Rust 1.85+
+- PostgreSQL 14+
+
+### Setup
+
+```bash
+# Clone
+git clone https://github.com/Berektassuly/testable-rust-architecture-template.git
+cd testable-rust-architecture-template
+
+# Configure
+cp .env.example .env
+# Edit .env with your database credentials
+
+# Create database
+createdb app_dev
+
+# Run
+cargo run
+```
+
+### Test the API
+
+```bash
+# Health check
+curl http://localhost:3000/health
+
+# Create item
+curl -X POST http://localhost:3000/items \
+  -H "Content-Type: application/json" \
+  -d '{"name": "My Item", "content": "Hello World"}'
+```
+
+## 🧪 Testing
+
+```bash
+# Run all tests
+cargo test
+
+# With coverage
+cargo install cargo-tarpaulin
+cargo tarpaulin --out Html
+
+# Run benchmarks
+cargo bench
+```
+
+### Testing with Mocks
+
+```rust
+use testable_rust_architecture_template::test_utils::{MockDatabaseClient, MockBlockchainClient};
+
+#[tokio::test]
+async fn test_with_mocks() {
+    let db = Arc::new(MockDatabaseClient::new());
+    let blockchain = Arc::new(MockBlockchainClient::new());
+    let state = Arc::new(AppState::new(db, blockchain));
+    
+    // Test your logic...
+}
+```
+
+## 📡 API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/items` | Create new item |
+| `GET` | `/health` | Detailed health check |
+| `GET` | `/health/live` | Liveness probe (k8s) |
+| `GET` | `/health/ready` | Readiness probe (k8s) |
+
+### Create Item
+
+```json
+// Request
+POST /items
+{
+  "name": "Item Name",
+  "content": "Content here",
+  "description": "Optional",
+  "metadata": {
+    "author": "Optional",
+    "tags": ["tag1", "tag2"]
+  }
+}
+
+// Response
+{
+  "id": "item_abc123",
+  "hash": "hash_def456",
+  "name": "Item Name",
+  "created_at": "2025-01-15T10:30:00Z"
+}
+```
+
+### Health Check
+
+```json
+// Response
+{
+  "status": "healthy",
+  "database": "healthy",
+  "blockchain": "healthy",
+  "timestamp": "2025-01-15T10:30:00Z",
+  "version": "0.2.0"
+}
+```
+
+## 🔒 Security
+
+### Input Validation
+
+```rust
+#[derive(Validate)]
+pub struct CreateItemRequest {
+    #[validate(length(min = 1, max = 255))]
+    pub name: String,
+    
+    #[validate(length(max = 1_048_576))]  // 1MB
+    pub content: String,
+}
+```
+
+### Secret Management
+
+```rust
+use secrecy::{SecretString, ExposeSecret};
+
+let private_key: SecretString = SecretString::from(key);
+// Never accidentally logged
+```
+
+## ⚙️ Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABASE_URL` | *required* | PostgreSQL connection |
+| `SOLANA_RPC_URL` | devnet | Blockchain RPC |
+| `ISSUER_PRIVATE_KEY` | *generated* | Ed25519 key (base58) |
+| `HOST` | `0.0.0.0` | Bind address |
+| `PORT` | `3000` | Server port |
+| `RUST_LOG` | `info` | Log level |
+
+## 📊 Observability
+
+### Structured Logging
+
+```rust
+#[instrument(skip(self), fields(item_name = %request.name))]
+pub async fn create_item(&self, request: &CreateItemRequest) {
+    info!("Creating item");
+}
+```
+
+### Log Configuration
+
+```bash
+# Development
+RUST_LOG=debug,tower_http=trace
+
+# Production
+RUST_LOG=info,sqlx=warn
+```
+
+## 🐳 Docker
+
+```dockerfile
+FROM rust:1.85-slim AS builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+COPY --from=builder /app/target/release/testable-rust-architecture-template /usr/local/bin/
+CMD ["testable-rust-architecture-template"]
+```
+
+## 📄 License
+
+[MIT](LICENSE) © [Mukhammedali Berektassuly](https://berektassuly.com)
+===== ./README_REFACTORED.md =====
+# 🏗️ Production-Ready Rust Architecture Template v0.3.0
+
+[![CI](https://github.com/Berektassuly/testable-rust-architecture-template/actions/workflows/ci.yml/badge.svg)](https://github.com/Berektassuly/testable-rust-architecture-template/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+Production-ready Rust template demonstrating testable architecture through trait-based abstraction and dependency injection.
+
+## 🆕 What's New in v0.3.0
+
+This release implements all 7 production-readiness improvements:
+
+### 1. ✅ SQLx Migration System
+- Migrations in `migrations/20240101000000_create_items_table.sql`
+- Proper indexes on frequently queried fields
+- Run with `sqlx migrate run`
+
+### 2. ✅ Cursor-Based Pagination
+- `GET /items?limit=20&cursor=item_abc123`
+- Stable pagination using `(created_at, id)` composite cursor
+- Returns `next_cursor` and `has_more` for easy iteration
+
+### 3. ✅ Rate Limiting (using `governor` crate)
+- Separate limits for `/items` (10 RPS) and `/health` (100 RPS)
+- Configurable via `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST`
+- Returns `X-RateLimit-*` headers and 429 responses
+
+### 4. ✅ Real Solana Integration
+- JSON-RPC client with retry logic
+- Transaction signing via `ed25519-dalek`
+- Feature flag: `real-blockchain` (disabled by default)
+
+### 5. ✅ Graceful Degradation with Retry Queue
+- Items saved with `pending_submission` status when blockchain unavailable
+- Background worker for automatic retries
+- Exponential backoff: 1s → 2s → 4s → ... → 5min max
+- Manual retry via `POST /items/{id}/retry`
+
+### 6. ✅ Database Integration Tests
+- Uses `testcontainers` with PostgreSQL 16
+- Tests CRUD, pagination, blockchain status updates
+- Run with `cargo test --test database_integration`
+
+### 7. ✅ OpenAPI Documentation
+- Full API documentation at `/swagger-ui`
+- OpenAPI 3.0 spec at `/api-docs/openapi.json`
+- All types annotated with `#[derive(ToSchema)]`
+
+## 📁 Project Structure
+
+```
+src/
+├── api/
+│   ├── handlers.rs     # Request handlers with OpenAPI annotations
+│   ├── router.rs       # Routes, middleware, rate limiting
+│   └── mod.rs
+├── app/
+│   ├── service.rs      # Business logic with graceful degradation
+│   ├── state.rs        # Shared application state
+│   ├── worker.rs       # Background retry worker
+│   └── mod.rs
+├── domain/
+│   ├── error.rs        # Error types
+│   ├── traits.rs       # Database & Blockchain traits
+│   ├── types.rs        # Item, Pagination, BlockchainStatus
+│   └── mod.rs
+├── infra/
+│   ├── blockchain/
+│   │   └── solana.rs   # Solana RPC client
+│   ├── database/
+│   │   └── postgres.rs # PostgreSQL with pagination & status updates
+│   └── mod.rs
+└── test_utils/
+    └── mocks.rs        # Mock implementations
+migrations/
+└── 20240101000000_create_items_table.sql
+tests/
+├── integration_test.rs
+└── database_integration.rs
+```
+
+## 🚀 Quick Start
+
+### Prerequisites
+- Rust 1.85+
+- PostgreSQL 14+
+- Docker (for integration tests)
+
+### Setup
+
+```bash
+# Clone
+git clone https://github.com/Berektassuly/testable-rust-architecture-template.git
+cd testable-rust-architecture-template
+
+# Configure
+cp .env.example .env
+# Edit .env with your database credentials
+
+# Install sqlx-cli
+cargo install sqlx-cli --no-default-features --features postgres
+
+# Run migrations
+sqlx migrate run
+
+# Start server
+cargo run
+```
+
+## 📡 API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/items` | Create new item |
+| `GET` | `/items` | List items (paginated) |
+| `GET` | `/items/{id}` | Get single item |
+| `POST` | `/items/{id}/retry` | Retry blockchain submission |
+| `GET` | `/health` | Detailed health check |
+| `GET` | `/health/live` | Kubernetes liveness probe |
+| `GET` | `/health/ready` | Kubernetes readiness probe |
+| `GET` | `/swagger-ui` | Interactive API documentation |
+| `GET` | `/api-docs/openapi.json` | OpenAPI 3.0 specification |
+
+### Example: List Items with Pagination
+
+```bash
+# First page
+curl "http://localhost:3000/items?limit=10"
+
+# Next page using cursor
+curl "http://localhost:3000/items?limit=10&cursor=item_abc123"
+```
+
+Response:
+```json
+{
+  "items": [...],
+  "next_cursor": "item_xyz789",
+  "has_more": true
+}
+```
+
+## ⚙️ Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABASE_URL` | *required* | PostgreSQL connection |
+| `SOLANA_RPC_URL` | devnet | Blockchain RPC |
+| `ISSUER_PRIVATE_KEY` | *generated* | Ed25519 key (base58) |
+| `HOST` | `0.0.0.0` | Bind address |
+| `PORT` | `3000` | Server port |
+| `ENABLE_RATE_LIMITING` | `false` | Enable rate limiting |
+| `RATE_LIMIT_RPS` | `10` | Requests per second |
+| `RATE_LIMIT_BURST` | `20` | Burst allowance |
+| `ENABLE_BACKGROUND_WORKER` | `true` | Enable retry worker |
+| `RUST_LOG` | `info` | Log level |
+
+## 🧪 Testing
+
+```bash
+# Unit tests
+cargo test --lib
+
+# Integration tests (requires PostgreSQL)
+cargo test --test integration_test
+
+# Database tests (requires Docker)
+cargo test --test database_integration -- --test-threads=1
+
+# All tests
+cargo test --all-features
+```
+
+## 🔒 Blockchain Status Flow
+
+```
+[Pending] → [PendingSubmission] → [Submitted] → [Confirmed]
+              ↓                                    
+           [Failed] (after 10 retries)
+```
+
+## 📊 Observability
+
+- Structured logging via `tracing`
+- Health checks for Kubernetes deployments
+- Rate limit headers for client guidance
+- Background worker metrics in logs
+
+## 📄 License
+
+[MIT](LICENSE) © [Mukhammedali Berektassuly](https://berektassuly.com)
+
+===== ./rust-toolchain.toml =====
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+
+===== ./src/api/handlers.rs =====
+//! HTTP request handlers with OpenAPI documentation.
+
+use std::sync::Arc;
+
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use tracing::error;
+use utoipa::OpenApi;
+
+use crate::app::AppState;
+use crate::domain::{
+    AppError, BlockchainError, CreateItemRequest, DatabaseError, ErrorDetail, ErrorResponse,
+    ExternalServiceError, HealthResponse, HealthStatus, Item, PaginatedResponse, PaginationParams,
+    RateLimitResponse,
+};
+
+/// OpenAPI documentation structure
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Testable Rust Architecture API",
+        version = "0.3.0",
+        description = "Production-ready Rust template demonstrating testable architecture with PostgreSQL and Solana integration",
+        contact(
+            name = "API Support",
+            email = "support@example.com"
+        ),
+        license(
+            name = "MIT"
+        )
+    ),
+    paths(
+        create_item_handler,
+        list_items_handler,
+        get_item_handler,
+        retry_blockchain_handler,
+        health_check_handler,
+        liveness_handler,
+        readiness_handler,
+    ),
+    components(
+        schemas(
+            Item,
+            CreateItemRequest,
+            crate::domain::ItemMetadata,
+            crate::domain::ItemMetadataRequest,
+            crate::domain::BlockchainStatus,
+            PaginationParams,
+            PaginatedResponse<Item>,
+            HealthResponse,
+            HealthStatus,
+            ErrorResponse,
+            ErrorDetail,
+            RateLimitResponse,
+        )
+    ),
+    tags(
+        (name = "items", description = "Item management endpoints"),
+        (name = "health", description = "Health check endpoints")
+    )
+)]
+pub struct ApiDoc;
+
+/// Create a new item
+#[utoipa::path(
+    post,
+    path = "/items",
+    tag = "items",
+    request_body = CreateItemRequest,
+    responses(
+        (status = 200, description = "Item created successfully", body = Item),
+        (status = 400, description = "Validation error", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 503, description = "Service unavailable", body = ErrorResponse)
+    )
+)]
+pub async fn create_item_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CreateItemRequest>,
+) -> Result<Json<Item>, AppError> {
+    let item = state.service.create_and_submit_item(&payload).await?;
+    Ok(Json(item))
+}
+
+/// List items with pagination
+#[utoipa::path(
+    get,
+    path = "/items",
+    tag = "items",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of items to return (1-100, default: 20)"),
+        ("cursor" = Option<String>, Query, description = "Cursor for pagination (item ID to start after)")
+    ),
+    responses(
+        (status = 200, description = "List of items", body = PaginatedResponse<Item>),
+        (status = 400, description = "Invalid pagination parameters", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
+pub async fn list_items_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<PaginatedResponse<Item>>, AppError> {
+    // Validate limit
+    let limit = params.limit.clamp(1, 100);
+    let items = state
+        .service
+        .list_items(limit, params.cursor.as_deref())
+        .await?;
+    Ok(Json(items))
+}
+
+/// Get a single item by ID
+#[utoipa::path(
+    get,
+    path = "/items/{id}",
+    tag = "items",
+    params(
+        ("id" = String, Path, description = "Item ID")
+    ),
+    responses(
+        (status = 200, description = "Item found", body = Item),
+        (status = 404, description = "Item not found", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
+pub async fn get_item_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Item>, AppError> {
+    let item = state
+        .service
+        .get_item(&id)
+        .await?
+        .ok_or(AppError::Database(DatabaseError::NotFound(id)))?;
+    Ok(Json(item))
+}
+
+/// Retry blockchain submission for an item
+#[utoipa::path(
+    post,
+    path = "/items/{id}/retry",
+    tag = "items",
+    params(
+        ("id" = String, Path, description = "Item ID")
+    ),
+    responses(
+        (status = 200, description = "Retry successful", body = Item),
+        (status = 400, description = "Item not eligible for retry", body = ErrorResponse),
+        (status = 404, description = "Item not found", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 503, description = "Blockchain unavailable", body = ErrorResponse)
+    )
+)]
+pub async fn retry_blockchain_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Item>, AppError> {
+    let item = state.service.retry_blockchain_submission(&id).await?;
+    Ok(Json(item))
+}
+
+/// Detailed health check
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "health",
+    responses(
+        (status = 200, description = "Health status", body = HealthResponse)
+    )
+)]
+pub async fn health_check_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    let health = state.service.health_check().await;
+    Json(health)
+}
+
+/// Kubernetes liveness probe
+#[utoipa::path(
+    get,
+    path = "/health/live",
+    tag = "health",
+    responses(
+        (status = 200, description = "Application is alive")
+    )
+)]
+pub async fn liveness_handler() -> StatusCode {
+    StatusCode::OK
+}
+
+/// Kubernetes readiness probe
+#[utoipa::path(
+    get,
+    path = "/health/ready",
+    tag = "health",
+    responses(
+        (status = 200, description = "Application is ready to serve traffic"),
+        (status = 503, description = "Application is not ready")
+    )
+)]
+pub async fn readiness_handler(State(state): State<Arc<AppState>>) -> StatusCode {
+    let health = state.service.health_check().await;
+    match health.status {
+        HealthStatus::Healthy | HealthStatus::Degraded => StatusCode::OK,
+        HealthStatus::Unhealthy => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> axum::response::Response {
+        let (status, error_type, message) = match &self {
+            AppError::Database(db_err) => match db_err {
+                DatabaseError::Connection(_) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "database_error",
+                    self.to_string(),
+                ),
+                DatabaseError::NotFound(_) => {
+                    (StatusCode::NOT_FOUND, "not_found", self.to_string())
+                }
+                DatabaseError::Duplicate(_) => {
+                    (StatusCode::CONFLICT, "duplicate", self.to_string())
+                }
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "database_error",
+                    self.to_string(),
+                ),
+            },
+            AppError::Blockchain(bc_err) => match bc_err {
+                BlockchainError::Connection(_) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "blockchain_error",
+                    self.to_string(),
+                ),
+                BlockchainError::InsufficientFunds => (
+                    StatusCode::PAYMENT_REQUIRED,
+                    "insufficient_funds",
+                    self.to_string(),
+                ),
+                BlockchainError::Timeout(_) => {
+                    (StatusCode::GATEWAY_TIMEOUT, "timeout", self.to_string())
+                }
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "blockchain_error",
+                    self.to_string(),
+                ),
+            },
+            AppError::ExternalService(ext_err) => match ext_err {
+                ExternalServiceError::Unavailable(_) => (
+                    StatusCode::BAD_GATEWAY,
+                    "external_service_error",
+                    self.to_string(),
+                ),
+                ExternalServiceError::Timeout(_) => {
+                    (StatusCode::GATEWAY_TIMEOUT, "timeout", self.to_string())
+                }
+                ExternalServiceError::RateLimited(_) => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limited",
+                    self.to_string(),
+                ),
+                _ => (
+                    StatusCode::BAD_GATEWAY,
+                    "external_service_error",
+                    self.to_string(),
+                ),
+            },
+            AppError::Config(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "configuration_error",
+                self.to_string(),
+            ),
+            AppError::Validation(_) => (
+                StatusCode::BAD_REQUEST,
+                "validation_error",
+                self.to_string(),
+            ),
+            AppError::Authentication(_) => (
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                self.to_string(),
+            ),
+            AppError::Authorization(_) => (
+                StatusCode::FORBIDDEN,
+                "authorization_error",
+                self.to_string(),
+            ),
+            AppError::Serialization(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "serialization_error",
+                self.to_string(),
+            ),
+            AppError::Deserialization(_) => (
+                StatusCode::BAD_REQUEST,
+                "deserialization_error",
+                self.to_string(),
+            ),
+            AppError::Internal(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                self.to_string(),
+            ),
+            AppError::NotSupported(_) => (
+                StatusCode::NOT_IMPLEMENTED,
+                "not_supported",
+                self.to_string(),
+            ),
+            AppError::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "Rate limit exceeded".to_string(),
+            ),
+        };
+
+        if status.is_server_error() {
+            error!(error_type = %error_type, message = %message, "Server error");
+        }
+
+        let body = Json(ErrorResponse {
+            error: ErrorDetail {
+                r#type: error_type.to_string(),
+                message,
+            },
+        });
+
+        (status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::DatabaseClient;
+    use crate::test_utils::{MockBlockchainClient, MockDatabaseClient};
+
+    #[tokio::test]
+    async fn test_create_item_handler() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+        let state = Arc::new(AppState::new(db, bc));
+
+        let payload = CreateItemRequest {
+            name: "Test Item".to_string(),
+            description: Some("Desc".to_string()),
+            content: "Content".to_string(),
+            metadata: None,
+        };
+
+        let result = create_item_handler(State(state), Json(payload)).await;
+        assert!(result.is_ok());
+        let Json(item) = result.unwrap();
+        assert_eq!(item.name, "Test Item");
+        assert_eq!(
+            item.blockchain_status,
+            crate::domain::BlockchainStatus::Submitted
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_item_handler() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+        let state = Arc::new(AppState::new(db.clone(), bc));
+
+        // Seed item
+        let req = CreateItemRequest::new("Seed".to_string(), "Content".to_string());
+        let created = db.create_item(&req).await.unwrap();
+
+        let result = get_item_handler(State(state), Path(created.id.clone())).await;
+        assert!(result.is_ok());
+        let Json(fetched) = result.unwrap();
+        assert_eq!(fetched.id, created.id);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_handler() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+        let state = Arc::new(AppState::new(db, bc));
+
+        let Json(resp) = health_check_handler(State(state)).await;
+        assert_eq!(resp.status, HealthStatus::Healthy);
+    }
+}
+
+===== ./src/api/mod.rs =====
+//! The API layer, containing web handlers and routing.
+
+pub mod handlers;
+pub mod router;
+
+pub use handlers::ApiDoc;
+pub use router::{RateLimitConfig, create_router, create_router_with_rate_limit};
+
+===== ./src/api/router.rs =====
+//! HTTP routing configuration with rate limiting and OpenAPI documentation.
+
+use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::State,
+    http::{Request, Response, StatusCode},
+    middleware::{self, Next},
+    response::IntoResponse,
+    routing::{get, post},
+};
+use governor::{
+    Quota, RateLimiter,
+    clock::DefaultClock,
+    state::{InMemoryState, NotKeyed},
+};
+use tower::ServiceBuilder;
+use tower_http::{
+    timeout::TimeoutLayer,
+    trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
+};
+use tracing::Level;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
+
+use crate::app::AppState;
+use crate::domain::{ErrorDetail, ErrorResponse, RateLimitResponse};
+
+use super::handlers::{
+    ApiDoc, create_item_handler, get_item_handler, health_check_handler, list_items_handler,
+    liveness_handler, readiness_handler, retry_blockchain_handler,
+};
+
+/// Rate limiter configuration
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    /// Requests per second for general endpoints
+    pub general_rps: u32,
+    /// Burst size for general endpoints
+    pub general_burst: u32,
+    /// Requests per second for health endpoints
+    pub health_rps: u32,
+    /// Burst size for health endpoints
+    pub health_burst: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            general_rps: 10,
+            general_burst: 20,
+            health_rps: 100,
+            health_burst: 100,
+        }
+    }
+}
+
+impl RateLimitConfig {
+    /// Create config from environment variables
+    pub fn from_env() -> Self {
+        let general_rps = std::env::var("RATE_LIMIT_RPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let general_burst = std::env::var("RATE_LIMIT_BURST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+
+        Self {
+            general_rps,
+            general_burst,
+            health_rps: 100,
+            health_burst: 100,
+        }
+    }
+}
+
+/// Shared rate limiter state
+pub struct RateLimitState {
+    items_limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
+    health_limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
+    config: RateLimitConfig,
+}
+
+impl RateLimitState {
+    pub fn new(config: RateLimitConfig) -> Self {
+        let items_quota = Quota::per_second(NonZeroU32::new(config.general_rps).unwrap())
+            .allow_burst(NonZeroU32::new(config.general_burst).unwrap());
+        let health_quota = Quota::per_second(NonZeroU32::new(config.health_rps).unwrap())
+            .allow_burst(NonZeroU32::new(config.health_burst).unwrap());
+
+        Self {
+            items_limiter: RateLimiter::direct(items_quota),
+            health_limiter: RateLimiter::direct(health_quota),
+            config,
+        }
+    }
+}
+
+/// Rate limit middleware for items endpoints
+async fn rate_limit_items_middleware(
+    State(rate_limit): State<Arc<RateLimitState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    match rate_limit.items_limiter.check() {
+        Ok(_) => {
+            let mut response = next.run(request).await;
+            // Add rate limit headers
+            let headers = response.headers_mut();
+            headers.insert(
+                "X-RateLimit-Limit",
+                rate_limit.config.general_rps.to_string().parse().unwrap(),
+            );
+            response
+        }
+        Err(not_until) => {
+            let wait_time = not_until.wait_time_from(governor::clock::Clock::now(
+                &governor::clock::DefaultClock::default(),
+            ));
+            let retry_after = wait_time.as_secs();
+
+            let body = RateLimitResponse {
+                error: ErrorDetail {
+                    r#type: "rate_limited".to_string(),
+                    message: "Rate limit exceeded. Please slow down your requests.".to_string(),
+                },
+                retry_after,
+            };
+
+            let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+            let headers = response.headers_mut();
+            headers.insert(
+                "X-RateLimit-Limit",
+                rate_limit.config.general_rps.to_string().parse().unwrap(),
+            );
+            headers.insert("X-RateLimit-Remaining", "0".parse().unwrap());
+            headers.insert("Retry-After", retry_after.to_string().parse().unwrap());
+            response
+        }
+    }
+}
+
+/// Rate limit middleware for health endpoints
+async fn rate_limit_health_middleware(
+    State(rate_limit): State<Arc<RateLimitState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    match rate_limit.health_limiter.check() {
+        Ok(_) => next.run(request).await,
+        Err(not_until) => {
+            let wait_time = not_until.wait_time_from(governor::clock::Clock::now(
+                &governor::clock::DefaultClock::default(),
+            ));
+            let retry_after = wait_time.as_secs();
+
+            let body = ErrorResponse {
+                error: ErrorDetail {
+                    r#type: "rate_limited".to_string(),
+                    message: "Rate limit exceeded".to_string(),
+                },
+            };
+
+            let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+            response
+                .headers_mut()
+                .insert("Retry-After", retry_after.to_string().parse().unwrap());
+            response
+        }
+    }
+}
+
+/// Create router without rate limiting
+pub fn create_router(app_state: Arc<AppState>) -> Router {
+    let middleware = ServiceBuilder::new()
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(30),
+        ));
+
+    // Items routes
+    let items_routes = Router::new()
+        .route("/", post(create_item_handler).get(list_items_handler))
+        .route("/{id}", get(get_item_handler))
+        .route("/{id}/retry", post(retry_blockchain_handler));
+
+    // Health routes
+    let health_routes = Router::new()
+        .route("/", get(health_check_handler))
+        .route("/live", get(liveness_handler))
+        .route("/ready", get(readiness_handler));
+
+    Router::new()
+        .nest("/items", items_routes)
+        .nest("/health", health_routes)
+        .layer(middleware)
+        .with_state(app_state)
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+}
+
+/// Create router with rate limiting enabled
+pub fn create_router_with_rate_limit(app_state: Arc<AppState>, config: RateLimitConfig) -> Router {
+    let rate_limit_state = Arc::new(RateLimitState::new(config));
+
+    let middleware = ServiceBuilder::new()
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(30),
+        ));
+
+    // Items routes with rate limiting
+    let items_routes = Router::new()
+        .route("/", post(create_item_handler).get(list_items_handler))
+        .route("/{id}", get(get_item_handler))
+        .route("/{id}/retry", post(retry_blockchain_handler))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&rate_limit_state),
+            rate_limit_items_middleware,
+        ));
+
+    // Health routes with separate rate limiting
+    let health_routes = Router::new()
+        .route("/", get(health_check_handler))
+        .route("/live", get(liveness_handler))
+        .route("/ready", get(readiness_handler))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&rate_limit_state),
+            rate_limit_health_middleware,
+        ));
+
+    Router::new()
+        .nest("/items", items_routes)
+        .nest("/health", health_routes)
+        .layer(middleware)
+        .with_state(app_state)
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+}
+
+===== ./src/app/mod.rs =====
+//! Application layer containing business logic and shared state.
+
+pub mod service;
+pub mod state;
+pub mod worker;
+
+pub use service::AppService;
+pub use state::AppState;
+pub use worker::{BlockchainRetryWorker, WorkerConfig, spawn_worker};
+
+===== ./src/app/service.rs =====
+//! Application service layer with graceful degradation.
+
+use chrono::{Duration, Utc};
+use std::sync::Arc;
+use tracing::{error, info, instrument, warn};
+use validator::Validate;
+
+use crate::domain::{
+    AppError, BlockchainClient, BlockchainStatus, CreateItemRequest, DatabaseClient,
+    HealthResponse, HealthStatus, Item, PaginatedResponse, ValidationError,
+};
+
+/// Maximum number of retry attempts for blockchain submission
+const MAX_RETRY_ATTEMPTS: i32 = 10;
+
+/// Maximum backoff duration in seconds (5 minutes)
+const MAX_BACKOFF_SECS: i64 = 300;
+
+/// Application service containing business logic
+pub struct AppService {
+    db_client: Arc<dyn DatabaseClient>,
+    blockchain_client: Arc<dyn BlockchainClient>,
+}
+
+impl AppService {
+    #[must_use]
+    pub fn new(
+        db_client: Arc<dyn DatabaseClient>,
+        blockchain_client: Arc<dyn BlockchainClient>,
+    ) -> Self {
+        Self {
+            db_client,
+            blockchain_client,
+        }
+    }
+
+    /// Create a new item and attempt blockchain submission.
+    /// If blockchain is unavailable, stores item with pending_submission status.
+    #[instrument(skip(self, request), fields(item_name = %request.name))]
+    pub async fn create_and_submit_item(
+        &self,
+        request: &CreateItemRequest,
+    ) -> Result<Item, AppError> {
+        request.validate().map_err(|e| {
+            warn!(error = %e, "Validation failed");
+            AppError::Validation(ValidationError::Multiple(e.to_string()))
+        })?;
+
+        info!("Creating new item: {}", request.name);
+        let mut item = self.db_client.create_item(request).await?;
+        info!(item_id = %item.id, "Item created in database");
+
+        let hash = self.generate_hash(&item);
+
+        // Attempt blockchain submission with graceful degradation
+        match self.blockchain_client.submit_transaction(&hash).await {
+            Ok(signature) => {
+                info!(item_id = %item.id, signature = %signature, "Submitted to blockchain");
+                self.db_client
+                    .update_blockchain_status(
+                        &item.id,
+                        BlockchainStatus::Submitted,
+                        Some(&signature),
+                        None,
+                        None,
+                    )
+                    .await?;
+                item.blockchain_status = BlockchainStatus::Submitted;
+                item.blockchain_signature = Some(signature);
+            }
+            Err(e) => {
+                warn!(item_id = %item.id, error = ?e, "Blockchain submission failed, queuing for retry");
+                let next_retry = Utc::now() + Duration::seconds(1);
+                self.db_client
+                    .update_blockchain_status(
+                        &item.id,
+                        BlockchainStatus::PendingSubmission,
+                        None,
+                        Some(&e.to_string()),
+                        Some(next_retry),
+                    )
+                    .await?;
+                item.blockchain_status = BlockchainStatus::PendingSubmission;
+                item.blockchain_last_error = Some(e.to_string());
+                item.blockchain_next_retry_at = Some(next_retry);
+            }
+        }
+
+        Ok(item)
+    }
+
+    /// Get an item by ID
+    #[instrument(skip(self))]
+    pub async fn get_item(&self, id: &str) -> Result<Option<Item>, AppError> {
+        self.db_client.get_item(id).await
+    }
+
+    /// List items with pagination
+    #[instrument(skip(self))]
+    pub async fn list_items(
+        &self,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<PaginatedResponse<Item>, AppError> {
+        self.db_client.list_items(limit, cursor).await
+    }
+
+    /// Retry blockchain submission for a specific item
+    #[instrument(skip(self))]
+    pub async fn retry_blockchain_submission(&self, id: &str) -> Result<Item, AppError> {
+        let item = self.db_client.get_item(id).await?.ok_or_else(|| {
+            AppError::Database(crate::domain::DatabaseError::NotFound(id.to_string()))
+        })?;
+
+        if item.blockchain_status != BlockchainStatus::PendingSubmission
+            && item.blockchain_status != BlockchainStatus::Failed
+        {
+            return Err(AppError::Validation(ValidationError::InvalidField {
+                field: "blockchain_status".to_string(),
+                message: "Item is not pending submission or failed".to_string(),
+            }));
+        }
+
+        let hash = self.generate_hash(&item);
+
+        match self.blockchain_client.submit_transaction(&hash).await {
+            Ok(signature) => {
+                info!(item_id = %item.id, signature = %signature, "Retry submission successful");
+                self.db_client
+                    .update_blockchain_status(
+                        id,
+                        BlockchainStatus::Submitted,
+                        Some(&signature),
+                        None,
+                        None,
+                    )
+                    .await?;
+                let mut updated_item = item;
+                updated_item.blockchain_status = BlockchainStatus::Submitted;
+                updated_item.blockchain_signature = Some(signature);
+                updated_item.blockchain_last_error = None;
+                updated_item.blockchain_next_retry_at = None;
+                Ok(updated_item)
+            }
+            Err(e) => {
+                warn!(item_id = %item.id, error = ?e, "Retry submission failed");
+                let retry_count = self.db_client.increment_retry_count(id).await?;
+                let (status, next_retry) = if retry_count >= MAX_RETRY_ATTEMPTS {
+                    (BlockchainStatus::Failed, None)
+                } else {
+                    let backoff = calculate_backoff(retry_count);
+                    (
+                        BlockchainStatus::PendingSubmission,
+                        Some(Utc::now() + Duration::seconds(backoff)),
+                    )
+                };
+
+                self.db_client
+                    .update_blockchain_status(id, status, None, Some(&e.to_string()), next_retry)
+                    .await?;
+
+                Err(e)
+            }
+        }
+    }
+
+    /// Process pending blockchain submissions (called by background worker)
+    #[instrument(skip(self))]
+    pub async fn process_pending_submissions(&self, batch_size: i64) -> Result<usize, AppError> {
+        let pending_items = self
+            .db_client
+            .get_pending_blockchain_items(batch_size)
+            .await?;
+        let count = pending_items.len();
+
+        if count == 0 {
+            return Ok(0);
+        }
+
+        info!(count = count, "Processing pending blockchain submissions");
+
+        for item in pending_items {
+            if let Err(e) = self.process_single_submission(&item).await {
+                error!(item_id = %item.id, error = ?e, "Failed to process pending submission");
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Process a single pending submission
+    async fn process_single_submission(&self, item: &Item) -> Result<(), AppError> {
+        let hash = self.generate_hash(item);
+
+        match self.blockchain_client.submit_transaction(&hash).await {
+            Ok(signature) => {
+                info!(item_id = %item.id, signature = %signature, "Background submission successful");
+                self.db_client
+                    .update_blockchain_status(
+                        &item.id,
+                        BlockchainStatus::Submitted,
+                        Some(&signature),
+                        None,
+                        None,
+                    )
+                    .await?;
+            }
+            Err(e) => {
+                warn!(item_id = %item.id, error = ?e, "Background submission failed");
+                let retry_count = self.db_client.increment_retry_count(&item.id).await?;
+                let (status, next_retry) = if retry_count >= MAX_RETRY_ATTEMPTS {
+                    (BlockchainStatus::Failed, None)
+                } else {
+                    let backoff = calculate_backoff(retry_count);
+                    (
+                        BlockchainStatus::PendingSubmission,
+                        Some(Utc::now() + Duration::seconds(backoff)),
+                    )
+                };
+
+                self.db_client
+                    .update_blockchain_status(
+                        &item.id,
+                        status,
+                        None,
+                        Some(&e.to_string()),
+                        next_retry,
+                    )
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Perform health check on all dependencies
+    #[instrument(skip(self))]
+    pub async fn health_check(&self) -> HealthResponse {
+        let db_health = match self.db_client.health_check().await {
+            Ok(()) => HealthStatus::Healthy,
+            Err(_) => HealthStatus::Unhealthy,
+        };
+        let blockchain_health = match self.blockchain_client.health_check().await {
+            Ok(()) => HealthStatus::Healthy,
+            Err(_) => HealthStatus::Unhealthy,
+        };
+        HealthResponse::new(db_health, blockchain_health)
+    }
+
+    /// Generate a content hash for blockchain submission
+    fn generate_hash(&self, item: &Item) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(item.id.as_bytes());
+        hasher.update(item.name.as_bytes());
+        hasher.update(item.content.as_bytes());
+        if let Some(ref desc) = item.description {
+            hasher.update(desc.as_bytes());
+        }
+        let result = hasher.finalize();
+        result.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+}
+
+/// Calculate exponential backoff with maximum cap
+fn calculate_backoff(retry_count: i32) -> i64 {
+    let backoff = 2_i64.pow(retry_count.min(8) as u32);
+    backoff.min(MAX_BACKOFF_SECS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_backoff() {
+        assert_eq!(calculate_backoff(0), 1);
+        assert_eq!(calculate_backoff(1), 2);
+        assert_eq!(calculate_backoff(2), 4);
+        assert_eq!(calculate_backoff(3), 8);
+        assert_eq!(calculate_backoff(4), 16);
+        assert_eq!(calculate_backoff(5), 32);
+        assert_eq!(calculate_backoff(6), 64);
+        assert_eq!(calculate_backoff(7), 128);
+        assert_eq!(calculate_backoff(8), 256);
+        assert_eq!(calculate_backoff(9), 256); // Capped at 2^8
+        assert_eq!(calculate_backoff(10), 256);
+    }
+}
+
+===== ./src/app/state.rs =====
+//! Application state management.
+
+use std::sync::Arc;
+
+use crate::domain::{BlockchainClient, DatabaseClient};
+
+use super::service::AppService;
+
+/// Shared application state
+#[derive(Clone)]
+pub struct AppState {
+    pub service: Arc<AppService>,
+    pub db_client: Arc<dyn DatabaseClient>,
+    pub blockchain_client: Arc<dyn BlockchainClient>,
+}
+
+impl AppState {
+    /// Create a new application state
+    #[must_use]
+    pub fn new(
+        db_client: Arc<dyn DatabaseClient>,
+        blockchain_client: Arc<dyn BlockchainClient>,
+    ) -> Self {
+        let service = Arc::new(AppService::new(
+            Arc::clone(&db_client),
+            Arc::clone(&blockchain_client),
+        ));
+        Self {
+            service,
+            db_client,
+            blockchain_client,
+        }
+    }
+}
+
+===== ./src/app/worker.rs =====
+//! Background worker for processing pending blockchain submissions.
+
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch;
+use tracing::{error, info};
+
+use super::service::AppService;
+
+/// Configuration for the background worker
+#[derive(Debug, Clone)]
+pub struct WorkerConfig {
+    /// Interval between processing batches
+    pub poll_interval: Duration,
+    /// Number of items to process per batch
+    pub batch_size: i64,
+    /// Whether the worker is enabled
+    pub enabled: bool,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(10),
+            batch_size: 10,
+            enabled: true,
+        }
+    }
+}
+
+/// Background worker for processing pending blockchain submissions
+pub struct BlockchainRetryWorker {
+    service: Arc<AppService>,
+    config: WorkerConfig,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+impl BlockchainRetryWorker {
+    /// Create a new worker instance
+    pub fn new(
+        service: Arc<AppService>,
+        config: WorkerConfig,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            service,
+            config,
+            shutdown_rx,
+        }
+    }
+
+    /// Run the worker loop
+    pub async fn run(mut self) {
+        if !self.config.enabled {
+            info!("Blockchain retry worker is disabled");
+            return;
+        }
+
+        info!(
+            poll_interval = ?self.config.poll_interval,
+            batch_size = self.config.batch_size,
+            "Starting blockchain retry worker"
+        );
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(self.config.poll_interval) => {
+                    self.process_batch().await;
+                }
+                result = self.shutdown_rx.changed() => {
+                    if result.is_ok() && *self.shutdown_rx.borrow() {
+                        info!("Blockchain retry worker shutting down");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Process a batch of pending submissions
+    async fn process_batch(&self) {
+        match self
+            .service
+            .process_pending_submissions(self.config.batch_size)
+            .await
+        {
+            Ok(0) => {
+                // No pending items, nothing to log
+            }
+            Ok(count) => {
+                info!(count = count, "Processed pending blockchain submissions");
+            }
+            Err(e) => {
+                error!(error = ?e, "Error processing pending submissions");
+            }
+        }
+    }
+}
+
+/// Spawn the background worker as a tokio task
+pub fn spawn_worker(
+    service: Arc<AppService>,
+    config: WorkerConfig,
+) -> (tokio::task::JoinHandle<()>, watch::Sender<bool>) {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let worker = BlockchainRetryWorker::new(service, config, shutdown_rx);
+    let handle = tokio::spawn(worker.run());
+    (handle, shutdown_tx)
+}
+
+===== ./src/domain/error.rs =====
+//! Application error types with proper error chaining.
+
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum DatabaseError {
+    #[error("Connection failed: {0}")]
+    Connection(String),
+    #[error("Query execution failed: {0}")]
+    Query(String),
+    #[error("Record not found: {0}")]
+    NotFound(String),
+    #[error("Duplicate record: {0}")]
+    Duplicate(String),
+    #[error("Pool exhausted: {0}")]
+    PoolExhausted(String),
+    #[error("Migration failed: {0}")]
+    Migration(String),
+}
+
+#[derive(Error, Debug)]
+pub enum BlockchainError {
+    #[error("Connection failed: {0}")]
+    Connection(String),
+    #[error("RPC call failed: {0}")]
+    RpcError(String),
+    #[error("Transaction failed: {0}")]
+    TransactionFailed(String),
+    #[error("Invalid signature: {0}")]
+    InvalidSignature(String),
+    #[error("Insufficient funds for transaction")]
+    InsufficientFunds,
+    #[error("Timeout waiting for confirmation: {0}")]
+    Timeout(String),
+}
+
+#[derive(Error, Debug)]
+pub enum ConfigError {
+    #[error("Missing environment variable: {0}")]
+    MissingEnvVar(String),
+    #[error("Invalid value for '{key}': {message}")]
+    InvalidValue { key: String, message: String },
+    #[error("Parse error: {0}")]
+    ParseError(String),
+}
+
+#[derive(Error, Debug)]
+pub enum ValidationError {
+    #[error("Invalid field '{field}': {message}")]
+    InvalidField { field: String, message: String },
+    #[error("Missing required field: {0}")]
+    MissingField(String),
+    #[error("Invalid format: {0}")]
+    InvalidFormat(String),
+    #[error("Validation failed: {0}")]
+    Multiple(String),
+}
+
+#[derive(Error, Debug)]
+pub enum ExternalServiceError {
+    #[error("HTTP request failed: {0}")]
+    HttpError(String),
+    #[error("Service unavailable: {0}")]
+    Unavailable(String),
+    #[error("Timeout: {0}")]
+    Timeout(String),
+    #[error("Rate limited: {0}")]
+    RateLimited(String),
+}
+
+#[derive(Error, Debug)]
+pub enum AppError {
+    #[error(transparent)]
+    Database(#[from] DatabaseError),
+    #[error(transparent)]
+    Blockchain(#[from] BlockchainError),
+    #[error(transparent)]
+    ExternalService(#[from] ExternalServiceError),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Validation(#[from] ValidationError),
+    #[error("Authentication failed: {0}")]
+    Authentication(String),
+    #[error("Authorization denied: {0}")]
+    Authorization(String),
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+    #[error("Deserialization error: {0}")]
+    Deserialization(String),
+    #[error("Internal error: {0}")]
+    Internal(String),
+    #[error("Operation not supported: {0}")]
+    NotSupported(String),
+    #[error("Rate limit exceeded")]
+    RateLimited,
+}
+
+impl From<serde_json::Error> for AppError {
+    fn from(err: serde_json::Error) -> Self {
+        AppError::Serialization(err.to_string())
+    }
+}
+
+impl From<validator::ValidationErrors> for AppError {
+    fn from(err: validator::ValidationErrors) -> Self {
+        AppError::Validation(ValidationError::Multiple(err.to_string()))
+    }
+}
+
+impl From<sqlx::Error> for DatabaseError {
+    fn from(err: sqlx::Error) -> Self {
+        match err {
+            sqlx::Error::RowNotFound => DatabaseError::NotFound("Row not found".to_string()),
+            sqlx::Error::PoolTimedOut => DatabaseError::PoolExhausted("Pool timed out".to_string()),
+            sqlx::Error::Database(db_err) => {
+                if db_err.code().is_some_and(|code| code == "23505") {
+                    return DatabaseError::Duplicate(db_err.message().to_string());
+                }
+                DatabaseError::Query(db_err.message().to_string())
+            }
+            _ => DatabaseError::Query(err.to_string()),
+        }
+    }
+}
+
+impl From<sqlx::migrate::MigrateError> for AppError {
+    fn from(err: sqlx::migrate::MigrateError) -> Self {
+        AppError::Database(DatabaseError::Migration(err.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_database_error_conversions() {
+        let not_found = DatabaseError::from(sqlx::Error::RowNotFound);
+        assert!(matches!(not_found, DatabaseError::NotFound(_)));
+
+        // Simulate duplicate key error check (requires constructing a specific sqlx error which is hard,
+        // so we check the fallback)
+        let generic = DatabaseError::from(sqlx::Error::WorkerCrashed);
+        assert!(matches!(generic, DatabaseError::Query(_)));
+    }
+
+    #[test]
+    fn test_validation_conversion() {
+        use validator::Validate;
+
+        #[derive(Validate)]
+        struct TestStruct {
+            #[validate(length(min = 1))]
+            val: String,
+        }
+
+        let s = TestStruct {
+            val: "".to_string(),
+        };
+        let err = s.validate().unwrap_err();
+        let app_err = AppError::from(err);
+
+        assert!(matches!(
+            app_err,
+            AppError::Validation(ValidationError::Multiple(_))
+        ));
+    }
+}
+
+===== ./src/domain/mod.rs =====
+//! Domain layer containing core business types, traits, and error definitions.
+
+pub mod error;
+pub mod traits;
+pub mod types;
+
+pub use error::{
+    AppError, BlockchainError, ConfigError, DatabaseError, ExternalServiceError, ValidationError,
+};
+pub use traits::{BlockchainClient, DatabaseClient};
+pub use types::{
+    BlockchainStatus, CreateItemRequest, ErrorDetail, ErrorResponse, HealthResponse, HealthStatus,
+    Item, ItemMetadata, ItemMetadataRequest, PaginatedResponse, PaginationParams,
+    RateLimitResponse,
+};
+
+===== ./src/domain/traits.rs =====
+//! Domain traits defining contracts for external systems.
+
+use async_trait::async_trait;
+
+use super::error::AppError;
+use super::types::{BlockchainStatus, CreateItemRequest, Item, PaginatedResponse};
+use chrono::{DateTime, Utc};
+
+/// Database client trait for persistence operations
+#[async_trait]
+pub trait DatabaseClient: Send + Sync {
+    /// Check database connectivity
+    async fn health_check(&self) -> Result<(), AppError>;
+
+    /// Get a single item by ID
+    async fn get_item(&self, id: &str) -> Result<Option<Item>, AppError>;
+
+    /// Create a new item
+    async fn create_item(&self, data: &CreateItemRequest) -> Result<Item, AppError>;
+
+    /// List items with cursor-based pagination
+    async fn list_items(
+        &self,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<PaginatedResponse<Item>, AppError>;
+
+    /// Update an existing item
+    async fn update_item(&self, id: &str, data: &CreateItemRequest) -> Result<Item, AppError> {
+        let _ = (id, data);
+        Err(AppError::NotSupported(
+            "update_item not implemented".to_string(),
+        ))
+    }
+
+    /// Delete an item
+    async fn delete_item(&self, id: &str) -> Result<bool, AppError> {
+        let _ = id;
+        Err(AppError::NotSupported(
+            "delete_item not implemented".to_string(),
+        ))
+    }
+
+    /// Update blockchain status for an item
+    async fn update_blockchain_status(
+        &self,
+        id: &str,
+        status: BlockchainStatus,
+        signature: Option<&str>,
+        error: Option<&str>,
+        next_retry_at: Option<DateTime<Utc>>,
+    ) -> Result<(), AppError>;
+
+    /// Get items pending blockchain submission
+    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, AppError>;
+
+    /// Increment retry count for an item
+    async fn increment_retry_count(&self, id: &str) -> Result<i32, AppError>;
+}
+
+/// Blockchain client trait for chain operations
+#[async_trait]
+pub trait BlockchainClient: Send + Sync {
+    /// Check blockchain RPC connectivity
+    async fn health_check(&self) -> Result<(), AppError>;
+
+    /// Submit a transaction with the given hash/memo
+    async fn submit_transaction(&self, hash: &str) -> Result<String, AppError>;
+
+    /// Get transaction confirmation status
+    async fn get_transaction_status(&self, signature: &str) -> Result<bool, AppError> {
+        let _ = signature;
+        Err(AppError::NotSupported(
+            "get_transaction_status not implemented".to_string(),
+        ))
+    }
+
+    /// Get current block height
+    async fn get_block_height(&self) -> Result<u64, AppError> {
+        Err(AppError::NotSupported(
+            "get_block_height not implemented".to_string(),
+        ))
+    }
+
+    /// Get latest blockhash for transaction construction
+    async fn get_latest_blockhash(&self) -> Result<String, AppError> {
+        Err(AppError::NotSupported(
+            "get_latest_blockhash not implemented".to_string(),
+        ))
+    }
+
+    /// Wait for transaction confirmation with timeout
+    async fn wait_for_confirmation(
+        &self,
+        signature: &str,
+        timeout_secs: u64,
+    ) -> Result<bool, AppError> {
+        let _ = (signature, timeout_secs);
+        Err(AppError::NotSupported(
+            "wait_for_confirmation not implemented".to_string(),
+        ))
+    }
+}
+
+===== ./src/domain/types.rs =====
+//! Domain types with validation support.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use utoipa::ToSchema;
+use validator::Validate;
+
+/// Status of blockchain submission for an item
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockchainStatus {
+    /// Initial state, not yet processed
+    #[default]
+    Pending,
+    /// Waiting to be submitted to blockchain
+    PendingSubmission,
+    /// Transaction submitted, awaiting confirmation
+    Submitted,
+    /// Transaction confirmed on blockchain
+    Confirmed,
+    /// Submission failed after max retries
+    Failed,
+}
+
+impl BlockchainStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::PendingSubmission => "pending_submission",
+            Self::Submitted => "submitted",
+            Self::Confirmed => "confirmed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::str::FromStr for BlockchainStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "pending_submission" => Ok(Self::PendingSubmission),
+            "submitted" => Ok(Self::Submitted),
+            "confirmed" => Ok(Self::Confirmed),
+            "failed" => Ok(Self::Failed),
+            _ => Err(format!("Invalid blockchain status: {}", s)),
+        }
+    }
+}
+
+impl std::fmt::Display for BlockchainStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Core item entity
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct Item {
+    /// Unique identifier (format: item_<uuid>)
+    #[schema(example = "item_abc123")]
+    pub id: String,
+    /// Content hash
+    #[schema(example = "hash_def456")]
+    pub hash: String,
+    /// Item name
+    #[schema(example = "My Item")]
+    pub name: String,
+    /// Optional description
+    #[schema(example = "A detailed description")]
+    pub description: Option<String>,
+    /// Item content
+    #[schema(example = "The actual content here")]
+    pub content: String,
+    /// Optional metadata
+    pub metadata: Option<ItemMetadata>,
+    /// Blockchain submission status
+    pub blockchain_status: BlockchainStatus,
+    /// Blockchain transaction signature (if submitted)
+    #[schema(example = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d")]
+    pub blockchain_signature: Option<String>,
+    /// Number of retry attempts for blockchain submission
+    pub blockchain_retry_count: i32,
+    /// Last error message from blockchain submission
+    pub blockchain_last_error: Option<String>,
+    /// Next scheduled retry time
+    pub blockchain_next_retry_at: Option<DateTime<Utc>>,
+    /// Creation timestamp
+    pub created_at: DateTime<Utc>,
+    /// Last update timestamp
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Item {
+    #[must_use]
+    pub fn new(id: String, hash: String, name: String, content: String) -> Self {
+        let now = Utc::now();
+        Self {
+            id,
+            hash,
+            name,
+            description: None,
+            content,
+            metadata: None,
+            blockchain_status: BlockchainStatus::Pending,
+            blockchain_signature: None,
+            blockchain_retry_count: 0,
+            blockchain_last_error: None,
+            blockchain_next_retry_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+/// Item metadata
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, ToSchema)]
+pub struct ItemMetadata {
+    /// Author name
+    #[schema(example = "John Doe")]
+    pub author: Option<String>,
+    /// Version string
+    #[schema(example = "1.0.0")]
+    pub version: Option<String>,
+    /// Tags for categorization
+    #[schema(example = json!(["rust", "blockchain"]))]
+    pub tags: Vec<String>,
+    /// Custom key-value fields
+    pub custom_fields: HashMap<String, String>,
+}
+
+/// Request to create a new item
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
+pub struct CreateItemRequest {
+    /// Item name (1-255 characters)
+    #[validate(length(
+        min = 1,
+        max = 255,
+        message = "Name must be between 1 and 255 characters"
+    ))]
+    #[schema(example = "My New Item")]
+    pub name: String,
+    /// Optional description (max 10000 characters)
+    #[validate(length(max = 10000, message = "Description must not exceed 10000 characters"))]
+    #[schema(example = "A detailed description of the item")]
+    pub description: Option<String>,
+    /// Item content (1-1MB)
+    #[validate(length(
+        min = 1,
+        max = 1048576,
+        message = "Content must be between 1 and 1048576 characters"
+    ))]
+    #[schema(example = "The content of the item")]
+    pub content: String,
+    /// Optional metadata
+    #[validate(nested)]
+    pub metadata: Option<ItemMetadataRequest>,
+}
+
+impl CreateItemRequest {
+    #[must_use]
+    pub fn new(name: String, content: String) -> Self {
+        Self {
+            name,
+            description: None,
+            content,
+            metadata: None,
+        }
+    }
+}
+
+/// Metadata for item creation request
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
+pub struct ItemMetadataRequest {
+    /// Author name (max 255 characters)
+    #[validate(length(max = 255))]
+    #[schema(example = "John Doe")]
+    pub author: Option<String>,
+    /// Version string (max 50 characters)
+    #[validate(length(max = 50))]
+    #[schema(example = "1.0.0")]
+    pub version: Option<String>,
+    /// Tags (max 20 tags)
+    #[validate(length(max = 20))]
+    pub tags: Vec<String>,
+    /// Custom fields
+    pub custom_fields: HashMap<String, String>,
+}
+
+/// Pagination parameters for list requests
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
+pub struct PaginationParams {
+    /// Maximum number of items to return (1-100, default: 20)
+    #[validate(range(min = 1, max = 100, message = "Limit must be between 1 and 100"))]
+    #[serde(default = "default_limit")]
+    #[schema(example = 20)]
+    pub limit: i64,
+    /// Cursor for pagination (item ID to start after)
+    #[schema(example = "item_abc123")]
+    pub cursor: Option<String>,
+}
+
+fn default_limit() -> i64 {
+    20
+}
+
+impl Default for PaginationParams {
+    fn default() -> Self {
+        Self {
+            limit: default_limit(),
+            cursor: None,
+        }
+    }
+}
+
+/// Paginated response wrapper
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PaginatedResponse<T: ToSchema> {
+    /// List of items
+    pub items: Vec<T>,
+    /// Cursor for next page (null if no more items)
+    #[schema(example = "item_xyz789")]
+    pub next_cursor: Option<String>,
+    /// Whether more items exist
+    pub has_more: bool,
+}
+
+impl<T: ToSchema> PaginatedResponse<T> {
+    pub fn new(items: Vec<T>, next_cursor: Option<String>, has_more: bool) -> Self {
+        Self {
+            items,
+            next_cursor,
+            has_more,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            items: Vec::new(),
+            next_cursor: None,
+            has_more: false,
+        }
+    }
+}
+
+/// Health status enum
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthStatus {
+    /// All systems operational
+    Healthy,
+    /// Some systems degraded but functional
+    Degraded,
+    /// Critical systems unavailable
+    Unhealthy,
+}
+
+/// Health check response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HealthResponse {
+    /// Overall system status
+    pub status: HealthStatus,
+    /// Database health status
+    pub database: HealthStatus,
+    /// Blockchain client health status
+    pub blockchain: HealthStatus,
+    /// Current server timestamp
+    pub timestamp: DateTime<Utc>,
+    /// Application version
+    #[schema(example = "0.3.0")]
+    pub version: String,
+}
+
+impl HealthResponse {
+    #[must_use]
+    pub fn new(database: HealthStatus, blockchain: HealthStatus) -> Self {
+        let status = match (&database, &blockchain) {
+            (HealthStatus::Healthy, HealthStatus::Healthy) => HealthStatus::Healthy,
+            (HealthStatus::Unhealthy, _) | (_, HealthStatus::Unhealthy) => HealthStatus::Unhealthy,
+            _ => HealthStatus::Degraded,
+        };
+        Self {
+            status,
+            database,
+            blockchain,
+            timestamp: Utc::now(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
+/// Error response structure
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErrorResponse {
+    /// Error details
+    pub error: ErrorDetail,
+}
+
+/// Error detail structure
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErrorDetail {
+    /// Error type identifier
+    #[schema(example = "validation_error")]
+    pub r#type: String,
+    /// Human-readable error message
+    #[schema(example = "Name must be between 1 and 255 characters")]
+    pub message: String,
+}
+
+/// Rate limit exceeded response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RateLimitResponse {
+    /// Error details
+    pub error: ErrorDetail,
+    /// Seconds until rate limit resets
+    #[schema(example = 60)]
+    pub retry_after: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_blockchain_status_display_and_parsing() {
+        let statuses = vec![
+            (BlockchainStatus::Pending, "pending"),
+            (BlockchainStatus::PendingSubmission, "pending_submission"),
+            (BlockchainStatus::Submitted, "submitted"),
+            (BlockchainStatus::Confirmed, "confirmed"),
+            (BlockchainStatus::Failed, "failed"),
+        ];
+
+        for (status, string) in statuses {
+            assert_eq!(status.as_str(), string);
+            assert_eq!(status.to_string(), string);
+            assert_eq!(BlockchainStatus::from_str(string).unwrap(), status);
+        }
+
+        assert!(BlockchainStatus::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_create_item_request_validation() {
+        // Valid request
+        let req = CreateItemRequest::new("Valid Name".to_string(), "Valid Content".to_string());
+        assert!(req.validate().is_ok());
+
+        // Invalid Name (empty)
+        let req = CreateItemRequest::new("".to_string(), "Content".to_string());
+        assert!(req.validate().is_err());
+
+        // Invalid Name (too long)
+        let name = "a".repeat(256);
+        let req = CreateItemRequest::new(name, "Content".to_string());
+        assert!(req.validate().is_err());
+
+        // Invalid Content (empty)
+        let req = CreateItemRequest::new("Name".to_string(), "".to_string());
+        assert!(req.validate().is_err());
+
+        // Invalid Content (too long)
+        let content = "a".repeat(1_048_577);
+        let req = CreateItemRequest::new("Name".to_string(), content);
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_pagination_params_validation() {
+        // Valid
+        let params = PaginationParams {
+            limit: 20,
+            cursor: None,
+        };
+        assert!(params.validate().is_ok());
+
+        // Invalid limit (too small)
+        let params = PaginationParams {
+            limit: 0,
+            cursor: None,
+        };
+        assert!(params.validate().is_err());
+
+        // Invalid limit (too large)
+        let params = PaginationParams {
+            limit: 101,
+            cursor: None,
+        };
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn test_health_response_logic() {
+        let healthy = HealthResponse::new(HealthStatus::Healthy, HealthStatus::Healthy);
+        assert_eq!(healthy.status, HealthStatus::Healthy);
+
+        let degraded = HealthResponse::new(HealthStatus::Healthy, HealthStatus::Unhealthy);
+        assert_eq!(degraded.status, HealthStatus::Unhealthy);
+
+        // Ensure version is present
+        assert!(!healthy.version.is_empty());
+    }
+}
+
+===== ./src/infra/blockchain/mod.rs =====
+//! Blockchain client implementations.
+
+pub mod solana;
+
+pub use solana::{RpcBlockchainClient, RpcClientConfig, signing_key_from_base58};
+
+===== ./src/infra/blockchain/solana.rs =====
+//! Blockchain RPC client implementation for Solana.
+//!
+//! This module provides both mock and real blockchain interactions.
+//! Real blockchain functionality is enabled with the `real-blockchain` feature.
+
+use async_trait::async_trait;
+use ed25519_dalek::{Signer, SigningKey};
+use reqwest::Client;
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tracing::{debug, info, instrument, warn};
+
+use crate::domain::{AppError, BlockchainClient, BlockchainError};
+
+/// Configuration for the RPC client
+#[derive(Debug, Clone)]
+pub struct RpcClientConfig {
+    pub timeout: Duration,
+    pub max_retries: u32,
+    pub retry_delay: Duration,
+    pub confirmation_timeout: Duration,
+}
+
+impl Default for RpcClientConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            max_retries: 3,
+            retry_delay: Duration::from_millis(500),
+            confirmation_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Solana RPC blockchain client
+pub struct RpcBlockchainClient {
+    http_client: Client,
+    rpc_url: String,
+    signing_key: SigningKey,
+    config: RpcClientConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonRpcRequest<T: Serialize> {
+    jsonrpc: &'static str,
+    id: u64,
+    method: String,
+    params: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcResponse<T> {
+    result: Option<T>,
+    error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcError {
+    code: i64,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockhashResponse {
+    blockhash: String,
+    #[serde(rename = "lastValidBlockHeight")]
+    #[allow(dead_code)]
+    last_valid_block_height: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockhashResult {
+    value: BlockhashResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignatureStatus {
+    #[allow(dead_code)]
+    slot: Option<u64>,
+    #[allow(dead_code)]
+    confirmations: Option<u64>,
+    err: Option<serde_json::Value>,
+    #[serde(rename = "confirmationStatus")]
+    confirmation_status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignatureStatusResult {
+    value: Vec<Option<SignatureStatus>>,
+}
+
+impl RpcBlockchainClient {
+    /// Create a new RPC blockchain client with custom configuration
+    pub fn new(
+        rpc_url: &str,
+        signing_key: SigningKey,
+        config: RpcClientConfig,
+    ) -> Result<Self, AppError> {
+        let http_client = Client::builder()
+            .timeout(config.timeout)
+            .build()
+            .map_err(|e| AppError::Blockchain(BlockchainError::Connection(e.to_string())))?;
+        info!(rpc_url = %rpc_url, "Created blockchain client");
+        Ok(Self {
+            http_client,
+            rpc_url: rpc_url.to_string(),
+            signing_key,
+            config,
+        })
+    }
+
+    /// Create a new RPC blockchain client with default configuration
+    pub fn with_defaults(rpc_url: &str, signing_key: SigningKey) -> Result<Self, AppError> {
+        Self::new(rpc_url, signing_key, RpcClientConfig::default())
+    }
+
+    /// Get the public key as base58 string
+    #[must_use]
+    pub fn public_key(&self) -> String {
+        bs58::encode(self.signing_key.verifying_key().as_bytes()).into_string()
+    }
+
+    /// Sign a message and return the signature as base58
+    #[must_use]
+    pub fn sign(&self, message: &[u8]) -> String {
+        let signature = self.signing_key.sign(message);
+        bs58::encode(signature.to_bytes()).into_string()
+    }
+
+    /// Make an RPC call with retries
+    #[instrument(skip(self, params))]
+    async fn rpc_call<P: Serialize, R: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> Result<R, AppError> {
+        let mut last_error = None;
+        for attempt in 0..=self.config.max_retries {
+            if attempt > 0 {
+                tokio::time::sleep(self.config.retry_delay).await;
+            }
+            match self.do_rpc_call(method, &params).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    warn!(attempt = attempt, error = ?e, method = %method, "RPC call failed");
+                    last_error = Some(e);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            AppError::Blockchain(BlockchainError::RpcError("Unknown error".to_string()))
+        }))
+    }
+
+    /// Execute a single RPC call
+    async fn do_rpc_call<P: Serialize, R: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        params: &P,
+    ) -> Result<R, AppError> {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: method.to_string(),
+            params,
+        };
+
+        let response = self
+            .http_client
+            .post(&self.rpc_url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    AppError::Blockchain(BlockchainError::Timeout(e.to_string()))
+                } else {
+                    AppError::Blockchain(BlockchainError::RpcError(e.to_string()))
+                }
+            })?;
+
+        let rpc_response: JsonRpcResponse<R> = response
+            .json()
+            .await
+            .map_err(|e| AppError::Blockchain(BlockchainError::RpcError(e.to_string())))?;
+
+        if let Some(error) = rpc_response.error {
+            // Check for insufficient funds error
+            if error.message.contains("insufficient") || error.code == -32002 {
+                return Err(AppError::Blockchain(BlockchainError::InsufficientFunds));
+            }
+            return Err(AppError::Blockchain(BlockchainError::RpcError(format!(
+                "{}: {}",
+                error.code, error.message
+            ))));
+        }
+
+        rpc_response.result.ok_or_else(|| {
+            AppError::Blockchain(BlockchainError::RpcError("Empty response".to_string()))
+        })
+    }
+
+    /// Build and serialize a memo transaction
+    #[cfg(feature = "real-blockchain")]
+    fn build_memo_transaction(
+        &self,
+        memo: &str,
+        recent_blockhash: &str,
+    ) -> Result<String, AppError> {
+        // Memo program ID
+        let memo_program_id = bs58::decode("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
+            .into_vec()
+            .map_err(|e| AppError::Blockchain(BlockchainError::InvalidSignature(e.to_string())))?;
+
+        let recent_blockhash_bytes = bs58::decode(recent_blockhash)
+            .into_vec()
+            .map_err(|e| AppError::Blockchain(BlockchainError::InvalidSignature(e.to_string())))?;
+
+        let public_key = self.signing_key.verifying_key().to_bytes();
+
+        // Build a simplified transaction structure
+        // This is a minimal memo transaction
+        let mut tx_data = vec![
+            1u8, // sig count
+            2u8, // num accounts
+        ];
+
+        // Number of signatures
+        tx_data.push(1u8);
+
+        // Message header
+        tx_data.push(1u8); // num_required_signatures
+        tx_data.push(0u8); // num_readonly_signed_accounts
+        tx_data.push(1u8); // num_readonly_unsigned_accounts
+
+        // Account keys (payer + memo program)
+        tx_data.push(2u8); // num accounts
+        tx_data.extend_from_slice(&public_key);
+        tx_data.extend_from_slice(&memo_program_id);
+
+        // Recent blockhash
+        tx_data.extend_from_slice(&recent_blockhash_bytes);
+
+        // Instructions
+        tx_data.push(1u8); // num instructions
+
+        // Memo instruction
+        tx_data.push(1u8); // program_id_index (memo program)
+        tx_data.push(1u8); // num accounts
+        tx_data.push(0u8); // account index (payer)
+
+        // Memo data
+        let memo_bytes = memo.as_bytes();
+        tx_data.push(memo_bytes.len() as u8);
+        tx_data.extend_from_slice(memo_bytes);
+
+        // Sign the message (everything after signatures)
+        let _message_start = 1 + 64; // 1 byte for sig count, 64 bytes for signature placeholder
+        let message = &tx_data[1..]; // Skip signature count
+        let signature = self.signing_key.sign(message);
+
+        // Insert signature
+        let mut final_tx = vec![1u8]; // signature count
+        final_tx.extend_from_slice(&signature.to_bytes());
+        final_tx.extend_from_slice(message);
+
+        Ok(bs58::encode(&final_tx).into_string())
+    }
+}
+
+#[async_trait]
+impl BlockchainClient for RpcBlockchainClient {
+    #[instrument(skip(self))]
+    async fn health_check(&self) -> Result<(), AppError> {
+        let _: u64 = self.rpc_call("getSlot", Vec::<()>::new()).await?;
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn submit_transaction(&self, hash: &str) -> Result<String, AppError> {
+        info!(hash = %hash, "Submitting transaction");
+
+        #[cfg(feature = "real-blockchain")]
+        {
+            // Get recent blockhash
+            let blockhash = self.get_latest_blockhash().await?;
+            debug!(blockhash = %blockhash, "Got recent blockhash");
+
+            // Build and sign transaction
+            let tx = self.build_memo_transaction(hash, &blockhash)?;
+            debug!("Built memo transaction");
+
+            // Send transaction
+            let params = serde_json::json!([tx, {"encoding": "base58"}]);
+            let signature: String = self.rpc_call("sendTransaction", params).await?;
+            info!(signature = %signature, "Transaction sent");
+
+            Ok(signature)
+        }
+
+        #[cfg(not(feature = "real-blockchain"))]
+        {
+            // Mock implementation for testing
+            let signature = self.sign(hash.as_bytes());
+            Ok(format!("tx_{}", &signature[..16]))
+        }
+    }
+
+    #[instrument(skip(self))]
+    async fn get_block_height(&self) -> Result<u64, AppError> {
+        self.rpc_call("getBlockHeight", Vec::<()>::new()).await
+    }
+
+    #[instrument(skip(self))]
+    async fn get_latest_blockhash(&self) -> Result<String, AppError> {
+        let result: BlockhashResult = self
+            .rpc_call("getLatestBlockhash", Vec::<()>::new())
+            .await?;
+        Ok(result.value.blockhash)
+    }
+
+    #[instrument(skip(self))]
+    async fn get_transaction_status(&self, signature: &str) -> Result<bool, AppError> {
+        let params = serde_json::json!([[signature], {"searchTransactionHistory": true}]);
+        let result: SignatureStatusResult = self.rpc_call("getSignatureStatuses", params).await?;
+
+        match result.value.first() {
+            Some(Some(status)) => {
+                // Check if transaction errored
+                if status.err.is_some() {
+                    return Err(AppError::Blockchain(BlockchainError::TransactionFailed(
+                        format!("Transaction failed: {:?}", status.err),
+                    )));
+                }
+                // Check confirmation status
+                let confirmed = status.confirmation_status.as_deref() == Some("confirmed")
+                    || status.confirmation_status.as_deref() == Some("finalized");
+                Ok(confirmed)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    #[instrument(skip(self))]
+    async fn wait_for_confirmation(
+        &self,
+        signature: &str,
+        timeout_secs: u64,
+    ) -> Result<bool, AppError> {
+        let timeout = Duration::from_secs(timeout_secs);
+        let start = std::time::Instant::now();
+        let poll_interval = Duration::from_millis(500);
+
+        while start.elapsed() < timeout {
+            match self.get_transaction_status(signature).await {
+                Ok(true) => {
+                    info!(signature = %signature, "Transaction confirmed");
+                    return Ok(true);
+                }
+                Ok(false) => {
+                    debug!(signature = %signature, "Transaction not yet confirmed");
+                }
+                Err(AppError::Blockchain(BlockchainError::TransactionFailed(msg))) => {
+                    return Err(AppError::Blockchain(BlockchainError::TransactionFailed(
+                        msg,
+                    )));
+                }
+                Err(e) => {
+                    warn!(signature = %signature, error = ?e, "Error checking transaction status");
+                }
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        Err(AppError::Blockchain(BlockchainError::Timeout(format!(
+            "Transaction {} not confirmed within {}s",
+            signature, timeout_secs
+        ))))
+    }
+}
+
+/// Parse a base58-encoded private key into a SigningKey
+pub fn signing_key_from_base58(secret: &SecretString) -> Result<SigningKey, AppError> {
+    let key_bytes = bs58::decode(secret.expose_secret())
+        .into_vec()
+        .map_err(|e| AppError::Blockchain(BlockchainError::InvalidSignature(e.to_string())))?;
+
+    // Handle both 32-byte (seed) and 64-byte (keypair) formats
+    let key_array: [u8; 32] = if key_bytes.len() == 64 {
+        // Solana keypair format: first 32 bytes are the secret key
+        key_bytes[..32].try_into().map_err(|_| {
+            AppError::Blockchain(BlockchainError::InvalidSignature(
+                "Invalid keypair format".to_string(),
+            ))
+        })?
+    } else if key_bytes.len() == 32 {
+        key_bytes.try_into().map_err(|v: Vec<u8>| {
+            AppError::Blockchain(BlockchainError::InvalidSignature(format!(
+                "Key must be 32 bytes, got {}",
+                v.len()
+            )))
+        })?
+    } else {
+        return Err(AppError::Blockchain(BlockchainError::InvalidSignature(
+            format!("Key must be 32 or 64 bytes, got {}", key_bytes.len()),
+        )));
+    };
+
+    Ok(SigningKey::from_bytes(&key_array))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn test_client_creation() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let client =
+            RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_public_key_generation() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let client =
+            RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
+                .unwrap();
+        let pubkey = client.public_key();
+        assert!(!pubkey.is_empty());
+        // Verify it decodes to 32 bytes (length can be 43 or 44 chars)
+        let decoded = bs58::decode(&pubkey)
+            .into_vec()
+            .expect("Should be valid base58");
+        assert_eq!(decoded.len(), 32);
+    }
+
+    #[test]
+    fn test_signing() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let client =
+            RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
+                .unwrap();
+        let signature = client.sign(b"test message");
+        assert!(!signature.is_empty());
+    }
+
+    #[test]
+    fn test_signing_key_from_base58_valid_32_bytes() {
+        let original_key = SigningKey::generate(&mut OsRng);
+        let encoded = bs58::encode(original_key.to_bytes()).into_string();
+        let secret = SecretString::from(encoded);
+        let result = signing_key_from_base58(&secret);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_signing_key_from_base58_valid_64_bytes() {
+        let original_key = SigningKey::generate(&mut OsRng);
+        let mut keypair = original_key.to_bytes().to_vec();
+        keypair.extend_from_slice(original_key.verifying_key().as_bytes());
+        let encoded = bs58::encode(&keypair).into_string();
+        let secret = SecretString::from(encoded);
+        let result = signing_key_from_base58(&secret);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_signing_key_from_base58_invalid() {
+        let secret = SecretString::from("invalid-base58!!!");
+        let result = signing_key_from_base58(&secret);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rpc_client_config_default() {
+        let config = RpcClientConfig::default();
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.timeout, Duration::from_secs(30));
+        assert_eq!(config.confirmation_timeout, Duration::from_secs(60));
+    }
+}
+
+===== ./src/infra/database/mod.rs =====
+//! Database client implementations.
+
+pub mod postgres;
+
+pub use postgres::{PostgresClient, PostgresConfig};
+
+===== ./src/infra/database/postgres.rs =====
+//! PostgreSQL database client implementation.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use std::time::Duration;
+use tracing::{info, instrument};
+
+use crate::domain::{
+    AppError, BlockchainStatus, CreateItemRequest, DatabaseClient, DatabaseError, Item,
+    ItemMetadata, PaginatedResponse,
+};
+
+/// PostgreSQL connection pool configuration
+#[derive(Debug, Clone)]
+pub struct PostgresConfig {
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub acquire_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub max_lifetime: Duration,
+}
+
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            min_connections: 2,
+            acquire_timeout: Duration::from_secs(3),
+            idle_timeout: Duration::from_secs(600),
+            max_lifetime: Duration::from_secs(1800),
+        }
+    }
+}
+
+/// PostgreSQL database client with connection pooling
+pub struct PostgresClient {
+    pool: PgPool,
+}
+
+impl PostgresClient {
+    /// Create a new PostgreSQL client with custom configuration
+    pub async fn new(database_url: &str, config: PostgresConfig) -> Result<Self, AppError> {
+        info!("Connecting to PostgreSQL...");
+        let pool = PgPoolOptions::new()
+            .max_connections(config.max_connections)
+            .min_connections(config.min_connections)
+            .acquire_timeout(config.acquire_timeout)
+            .idle_timeout(config.idle_timeout)
+            .max_lifetime(config.max_lifetime)
+            .connect(database_url)
+            .await
+            .map_err(|e| AppError::Database(DatabaseError::Connection(e.to_string())))?;
+        info!("Connected to PostgreSQL");
+        Ok(Self { pool })
+    }
+
+    /// Create a new PostgreSQL client with default configuration
+    pub async fn with_defaults(database_url: &str) -> Result<Self, AppError> {
+        Self::new(database_url, PostgresConfig::default()).await
+    }
+
+    /// Run database migrations using sqlx migrate
+    pub async fn run_migrations(&self) -> Result<(), AppError> {
+        info!("Running database migrations...");
+        sqlx::migrate!("./migrations")
+            .run(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(DatabaseError::Migration(e.to_string())))?;
+        info!("Database migrations completed successfully");
+        Ok(())
+    }
+
+    /// Get the underlying connection pool (for testing)
+    #[must_use]
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Parse a database row into an Item
+    fn row_to_item(row: &sqlx::postgres::PgRow) -> Result<Item, AppError> {
+        let metadata: Option<serde_json::Value> = row.try_get("metadata").ok();
+        let status_str: String = row.get("blockchain_status");
+
+        Ok(Item {
+            id: row.get("id"),
+            hash: row.get("hash"),
+            name: row.get("name"),
+            description: row.get("description"),
+            content: row.get("content"),
+            metadata: metadata.and_then(|v| serde_json::from_value(v).ok()),
+            blockchain_status: status_str.parse().unwrap_or(BlockchainStatus::Pending),
+            blockchain_signature: row.get("blockchain_signature"),
+            blockchain_retry_count: row.get("blockchain_retry_count"),
+            blockchain_last_error: row.get("blockchain_last_error"),
+            blockchain_next_retry_at: row.get("blockchain_next_retry_at"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
+    }
+}
+
+#[async_trait]
+impl DatabaseClient for PostgresClient {
+    #[instrument(skip(self))]
+    async fn health_check(&self) -> Result<(), AppError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(DatabaseError::Connection(e.to_string())))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn get_item(&self, id: &str) -> Result<Option<Item>, AppError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, hash, name, description, content, metadata, 
+                   blockchain_status, blockchain_signature, blockchain_retry_count,
+                   blockchain_last_error, blockchain_next_retry_at,
+                   created_at, updated_at 
+            FROM items 
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?;
+
+        match row {
+            Some(row) => Ok(Some(Self::row_to_item(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    #[instrument(skip(self, data), fields(item_name = %data.name))]
+    async fn create_item(&self, data: &CreateItemRequest) -> Result<Item, AppError> {
+        let id = format!("item_{}", uuid::Uuid::new_v4());
+        let hash = format!("hash_{}", uuid::Uuid::new_v4());
+        let now = Utc::now();
+
+        let metadata_json = data
+            .metadata
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| AppError::Serialization(e.to_string()))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, hash, name, description, content, metadata, 
+                               blockchain_status, blockchain_retry_count,
+                               created_at, updated_at) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "#,
+        )
+        .bind(&id)
+        .bind(&hash)
+        .bind(&data.name)
+        .bind(&data.description)
+        .bind(&data.content)
+        .bind(&metadata_json)
+        .bind(BlockchainStatus::Pending.as_str())
+        .bind(0i32)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        let metadata: Option<ItemMetadata> = data.metadata.as_ref().map(|m| ItemMetadata {
+            author: m.author.clone(),
+            version: m.version.clone(),
+            tags: m.tags.clone(),
+            custom_fields: m.custom_fields.clone(),
+        });
+
+        Ok(Item {
+            id,
+            hash,
+            name: data.name.clone(),
+            description: data.description.clone(),
+            content: data.content.clone(),
+            metadata,
+            blockchain_status: BlockchainStatus::Pending,
+            blockchain_signature: None,
+            blockchain_retry_count: 0,
+            blockchain_last_error: None,
+            blockchain_next_retry_at: None,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    #[instrument(skip(self))]
+    async fn list_items(
+        &self,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<PaginatedResponse<Item>, AppError> {
+        // Clamp limit to valid range
+        let limit = limit.clamp(1, 100);
+        // Fetch one extra to determine if there are more items
+        let fetch_limit = limit + 1;
+
+        let rows = match cursor {
+            Some(cursor_id) => {
+                // Get the created_at of the cursor item for proper pagination
+                let cursor_row = sqlx::query("SELECT created_at FROM items WHERE id = $1")
+                    .bind(cursor_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?;
+
+                let cursor_created_at: DateTime<Utc> = match cursor_row {
+                    Some(row) => row.get("created_at"),
+                    None => {
+                        return Err(AppError::Validation(
+                            crate::domain::ValidationError::InvalidField {
+                                field: "cursor".to_string(),
+                                message: "Invalid cursor".to_string(),
+                            },
+                        ));
+                    }
+                };
+
+                sqlx::query(
+                    r#"
+                    SELECT id, hash, name, description, content, metadata,
+                           blockchain_status, blockchain_signature, blockchain_retry_count,
+                           blockchain_last_error, blockchain_next_retry_at,
+                           created_at, updated_at
+                    FROM items
+                    WHERE (created_at, id) < ($1, $2)
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT $3
+                    "#,
+                )
+                .bind(cursor_created_at)
+                .bind(cursor_id)
+                .bind(fetch_limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?
+            }
+            None => sqlx::query(
+                r#"
+                    SELECT id, hash, name, description, content, metadata,
+                           blockchain_status, blockchain_signature, blockchain_retry_count,
+                           blockchain_last_error, blockchain_next_retry_at,
+                           created_at, updated_at
+                    FROM items
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT $1
+                    "#,
+            )
+            .bind(fetch_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?,
+        };
+
+        let has_more = rows.len() > limit as usize;
+        let items: Vec<Item> = rows
+            .iter()
+            .take(limit as usize)
+            .map(Self::row_to_item)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let next_cursor = if has_more {
+            items.last().map(|item| item.id.clone())
+        } else {
+            None
+        };
+
+        Ok(PaginatedResponse::new(items, next_cursor, has_more))
+    }
+
+    #[instrument(skip(self))]
+    async fn update_blockchain_status(
+        &self,
+        id: &str,
+        status: BlockchainStatus,
+        signature: Option<&str>,
+        error: Option<&str>,
+        next_retry_at: Option<DateTime<Utc>>,
+    ) -> Result<(), AppError> {
+        let now = Utc::now();
+
+        sqlx::query(
+            r#"
+            UPDATE items 
+            SET blockchain_status = $1,
+                blockchain_signature = COALESCE($2, blockchain_signature),
+                blockchain_last_error = $3,
+                blockchain_next_retry_at = $4,
+                updated_at = $5
+            WHERE id = $6
+            "#,
+        )
+        .bind(status.as_str())
+        .bind(signature)
+        .bind(error)
+        .bind(next_retry_at)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?;
+
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, AppError> {
+        let now = Utc::now();
+        let rows = sqlx::query(
+            r#"
+            SELECT id, hash, name, description, content, metadata,
+                   blockchain_status, blockchain_signature, blockchain_retry_count,
+                   blockchain_last_error, blockchain_next_retry_at,
+                   created_at, updated_at
+            FROM items
+            WHERE blockchain_status = 'pending_submission'
+              AND (blockchain_next_retry_at IS NULL OR blockchain_next_retry_at <= $1)
+              AND blockchain_retry_count < 10
+            ORDER BY blockchain_next_retry_at ASC NULLS FIRST, created_at ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?;
+
+        rows.iter().map(Self::row_to_item).collect()
+    }
+
+    #[instrument(skip(self))]
+    async fn increment_retry_count(&self, id: &str) -> Result<i32, AppError> {
+        let row = sqlx::query(
+            r#"
+            UPDATE items 
+            SET blockchain_retry_count = blockchain_retry_count + 1,
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING blockchain_retry_count
+            "#,
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?;
+
+        Ok(row.get("blockchain_retry_count"))
+    }
+}
+
+===== ./src/infra/mod.rs =====
+//! Infrastructure layer implementations.
+
+pub mod blockchain;
+pub mod database;
+
+pub use blockchain::{RpcBlockchainClient, RpcClientConfig, signing_key_from_base58};
+pub use database::{PostgresClient, PostgresConfig};
+
+===== ./src/lib.rs =====
+//! Testable Rust Architecture Template
+//!
+//! A production-ready Rust template demonstrating testable architecture through
+//! trait-based abstraction and dependency injection.
+//!
+//! # Features
+//!
+//! - Clean Architecture with layered design
+//! - Trait-based dependency injection for testability
+//! - PostgreSQL with SQLx migrations
+//! - Solana blockchain integration
+//! - OpenAPI documentation with Swagger UI
+//! - Rate limiting
+//! - Graceful degradation with retry queues
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────┐
+//! │              API Layer                  │
+//! │   HTTP handlers, routing, validation    │
+//! ├─────────────────────────────────────────┤
+//! │           Application Layer             │
+//! │    Business logic, orchestration        │
+//! ├─────────────────────────────────────────┤
+//! │             Domain Layer                │
+//! │     Traits, types, errors (pure Rust)   │
+//! ├─────────────────────────────────────────┤
+//! │          Infrastructure Layer           │
+//! │   Database, blockchain, external APIs   │
+//! └─────────────────────────────────────────┘
+//! ```
+
+pub mod api;
+pub mod app;
+pub mod domain;
+pub mod infra;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
+
+===== ./src/main.rs =====
+//! Application entry point.
+
+use std::env;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use dotenvy::dotenv;
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
+use secrecy::SecretString;
+use tokio::signal;
+use tracing::{info, warn};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+use testable_rust_architecture_template::api::{
+    RateLimitConfig, create_router, create_router_with_rate_limit,
+};
+use testable_rust_architecture_template::app::{AppState, WorkerConfig, spawn_worker};
+use testable_rust_architecture_template::infra::RpcBlockchainClient;
+use testable_rust_architecture_template::infra::{
+    PostgresClient, PostgresConfig, signing_key_from_base58,
+};
+
+/// Application configuration
+struct Config {
+    database_url: String,
+    blockchain_rpc_url: String,
+    signing_key: SigningKey,
+    host: String,
+    port: u16,
+    enable_rate_limiting: bool,
+    rate_limit_config: RateLimitConfig,
+    enable_background_worker: bool,
+    worker_config: WorkerConfig,
+}
+
+impl Config {
+    fn from_env() -> Result<Self> {
+        let database_url = env::var("DATABASE_URL").context("DATABASE_URL not set")?;
+        let blockchain_rpc_url = env::var("SOLANA_RPC_URL")
+            .unwrap_or_else(|_| "https://api.devnet.solana.com".to_string());
+        let signing_key = Self::load_signing_key()?;
+        let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+        let port = env::var("PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(3000);
+        let enable_rate_limiting = env::var("ENABLE_RATE_LIMITING")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let enable_background_worker = env::var("ENABLE_BACKGROUND_WORKER")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(true);
+
+        let rate_limit_config = RateLimitConfig::from_env();
+        let worker_config = WorkerConfig {
+            enabled: enable_background_worker,
+            ..Default::default()
+        };
+
+        Ok(Self {
+            database_url,
+            blockchain_rpc_url,
+            signing_key,
+            host,
+            port,
+            enable_rate_limiting,
+            rate_limit_config,
+            enable_background_worker,
+            worker_config,
+        })
+    }
+
+    fn load_signing_key() -> Result<SigningKey> {
+        match env::var("ISSUER_PRIVATE_KEY").ok() {
+            Some(key_str)
+                if !key_str.is_empty() && key_str != "YOUR_BASE58_ENCODED_PRIVATE_KEY_HERE" =>
+            {
+                info!("Loading signing key from environment");
+                let secret = SecretString::from(key_str);
+                signing_key_from_base58(&secret).context("Failed to parse ISSUER_PRIVATE_KEY")
+            }
+            _ => {
+                warn!("No valid ISSUER_PRIVATE_KEY, generating ephemeral keypair");
+                Ok(SigningKey::generate(&mut OsRng))
+            }
+        }
+    }
+}
+
+fn init_tracing() {
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,tower_http=debug,sqlx=warn"));
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("Received Ctrl+C"),
+        _ = terminate => info!("Received SIGTERM"),
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenv().ok();
+    init_tracing();
+
+    info!(
+        "🏗️  Testable Rust Architecture Template v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let config = Config::from_env()?;
+
+    let public_key = bs58::encode(config.signing_key.verifying_key().as_bytes()).into_string();
+    info!("🔑 Public key: {}", public_key);
+
+    info!("📦 Initializing infrastructure...");
+
+    // Initialize database
+    let db_config = PostgresConfig::default();
+    let postgres_client = PostgresClient::new(&config.database_url, db_config).await?;
+    postgres_client.run_migrations().await?;
+    info!("   ✓ Database connected and migrations applied");
+
+    // Initialize blockchain client
+    let blockchain_client =
+        RpcBlockchainClient::with_defaults(&config.blockchain_rpc_url, config.signing_key)?;
+    info!("   ✓ Blockchain client created");
+
+    // Create application state
+    let app_state = Arc::new(AppState::new(
+        Arc::new(postgres_client),
+        Arc::new(blockchain_client),
+    ));
+
+    // Start background worker if enabled
+    let worker_shutdown_tx = if config.enable_background_worker {
+        let (_handle, shutdown_tx) =
+            spawn_worker(Arc::clone(&app_state.service), config.worker_config);
+        info!("   ✓ Background worker started");
+        Some(shutdown_tx)
+    } else {
+        info!("   ○ Background worker disabled");
+        None
+    };
+
+    // Create router
+    let router = if config.enable_rate_limiting {
+        info!("   ✓ Rate limiting enabled");
+        create_router_with_rate_limit(app_state, config.rate_limit_config)
+    } else {
+        info!("   ○ Rate limiting disabled");
+        create_router(app_state)
+    };
+
+    let addr = format!("{}:{}", config.host, config.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    info!("🚀 Server starting on http://{}", addr);
+    info!("📖 Swagger UI available at http://{}/swagger-ui", addr);
+    info!("📄 OpenAPI spec at http://{}/api-docs/openapi.json", addr);
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // Signal worker to shutdown
+    if let Some(tx) = worker_shutdown_tx {
+        let _ = tx.send(true);
+    }
+
+    info!("Server shutdown complete");
+    Ok(())
+}
+
+===== ./src/test_utils/mocks.rs =====
+//! Mock implementations for testing.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use crate::domain::{
+    AppError, BlockchainClient, BlockchainError, BlockchainStatus, CreateItemRequest,
+    DatabaseClient, DatabaseError, Item, ItemMetadata, PaginatedResponse,
+};
+
+/// Configuration for mock behavior
+#[derive(Debug, Clone, Default)]
+pub struct MockConfig {
+    pub should_fail: bool,
+    pub error_message: Option<String>,
+}
+
+impl MockConfig {
+    #[must_use]
+    pub fn success() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn failure(message: impl Into<String>) -> Self {
+        Self {
+            should_fail: true,
+            error_message: Some(message.into()),
+        }
+    }
+}
+
+/// Mock database client for testing
+pub struct MockDatabaseClient {
+    storage: Arc<Mutex<HashMap<String, Item>>>,
+    config: MockConfig,
+    is_healthy: AtomicBool,
+}
+
+impl MockDatabaseClient {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_config(MockConfig::success())
+    }
+
+    #[must_use]
+    pub fn with_config(config: MockConfig) -> Self {
+        Self {
+            storage: Arc::new(Mutex::new(HashMap::new())),
+            config,
+            is_healthy: AtomicBool::new(true),
+        }
+    }
+
+    #[must_use]
+    pub fn failing(message: impl Into<String>) -> Self {
+        Self::with_config(MockConfig::failure(message))
+    }
+
+    pub fn set_healthy(&self, healthy: bool) {
+        self.is_healthy.store(healthy, Ordering::Relaxed);
+    }
+
+    /// Get all stored items (for testing)
+    pub fn get_all_items(&self) -> Vec<Item> {
+        self.storage.lock().unwrap().values().cloned().collect()
+    }
+
+    fn check_should_fail(&self) -> Result<(), AppError> {
+        if self.config.should_fail {
+            let msg = self
+                .config
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "Mock error".to_string());
+            return Err(AppError::Database(DatabaseError::Query(msg)));
+        }
+        Ok(())
+    }
+}
+
+impl Default for MockDatabaseClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl DatabaseClient for MockDatabaseClient {
+    async fn health_check(&self) -> Result<(), AppError> {
+        if !self.is_healthy.load(Ordering::Relaxed) {
+            return Err(AppError::Database(DatabaseError::Connection(
+                "Unhealthy".to_string(),
+            )));
+        }
+        self.check_should_fail()
+    }
+
+    async fn get_item(&self, id: &str) -> Result<Option<Item>, AppError> {
+        self.check_should_fail()?;
+        let storage = self.storage.lock().unwrap();
+        Ok(storage.get(id).cloned())
+    }
+
+    async fn create_item(&self, data: &CreateItemRequest) -> Result<Item, AppError> {
+        self.check_should_fail()?;
+        let id = format!("item_{}", uuid::Uuid::new_v4());
+        let now = Utc::now();
+        let metadata = data.metadata.as_ref().map(|m| ItemMetadata {
+            author: m.author.clone(),
+            version: m.version.clone(),
+            tags: m.tags.clone(),
+            custom_fields: m.custom_fields.clone(),
+        });
+        let item = Item {
+            id: id.clone(),
+            hash: format!("hash_{}", id),
+            name: data.name.clone(),
+            description: data.description.clone(),
+            content: data.content.clone(),
+            metadata,
+            blockchain_status: BlockchainStatus::Pending,
+            blockchain_signature: None,
+            blockchain_retry_count: 0,
+            blockchain_last_error: None,
+            blockchain_next_retry_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut storage = self.storage.lock().unwrap();
+        storage.insert(id, item.clone());
+        Ok(item)
+    }
+
+    async fn list_items(
+        &self,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<PaginatedResponse<Item>, AppError> {
+        self.check_should_fail()?;
+        let storage = self.storage.lock().unwrap();
+        let mut items: Vec<Item> = storage.values().cloned().collect();
+        items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        // Apply cursor
+        let items = if let Some(cursor_id) = cursor {
+            let pos = items.iter().position(|i| i.id == cursor_id);
+            match pos {
+                Some(p) => items.into_iter().skip(p + 1).collect(),
+                None => {
+                    return Err(AppError::Validation(
+                        crate::domain::ValidationError::InvalidField {
+                            field: "cursor".to_string(),
+                            message: "Invalid cursor".to_string(),
+                        },
+                    ));
+                }
+            }
+        } else {
+            items
+        };
+
+        let limit = limit.clamp(1, 100) as usize;
+        let has_more = items.len() > limit;
+        let items: Vec<Item> = items.into_iter().take(limit).collect();
+        let next_cursor = if has_more {
+            items.last().map(|i| i.id.clone())
+        } else {
+            None
+        };
+
+        Ok(PaginatedResponse::new(items, next_cursor, has_more))
+    }
+
+    async fn update_blockchain_status(
+        &self,
+        id: &str,
+        status: BlockchainStatus,
+        signature: Option<&str>,
+        error: Option<&str>,
+        next_retry_at: Option<DateTime<Utc>>,
+    ) -> Result<(), AppError> {
+        self.check_should_fail()?;
+        let mut storage = self.storage.lock().unwrap();
+        if let Some(item) = storage.get_mut(id) {
+            item.blockchain_status = status;
+            if let Some(sig) = signature {
+                item.blockchain_signature = Some(sig.to_string());
+            }
+            item.blockchain_last_error = error.map(|e| e.to_string());
+            item.blockchain_next_retry_at = next_retry_at;
+            item.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, AppError> {
+        self.check_should_fail()?;
+        let storage = self.storage.lock().unwrap();
+        let now = Utc::now();
+        let mut items: Vec<Item> = storage
+            .values()
+            .filter(|i| {
+                i.blockchain_status == BlockchainStatus::PendingSubmission
+                    && i.blockchain_retry_count < 10
+                    && i.blockchain_next_retry_at.map(|t| t <= now).unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(items.into_iter().take(limit as usize).collect())
+    }
+
+    async fn increment_retry_count(&self, id: &str) -> Result<i32, AppError> {
+        self.check_should_fail()?;
+        let mut storage = self.storage.lock().unwrap();
+        if let Some(item) = storage.get_mut(id) {
+            item.blockchain_retry_count += 1;
+            item.updated_at = Utc::now();
+            Ok(item.blockchain_retry_count)
+        } else {
+            Err(AppError::Database(DatabaseError::NotFound(id.to_string())))
+        }
+    }
+}
+
+/// Mock blockchain client for testing
+pub struct MockBlockchainClient {
+    transactions: Arc<Mutex<Vec<String>>>,
+    config: MockConfig,
+    is_healthy: AtomicBool,
+}
+
+impl MockBlockchainClient {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_config(MockConfig::success())
+    }
+
+    #[must_use]
+    pub fn with_config(config: MockConfig) -> Self {
+        Self {
+            transactions: Arc::new(Mutex::new(Vec::new())),
+            config,
+            is_healthy: AtomicBool::new(true),
+        }
+    }
+
+    #[must_use]
+    pub fn failing(message: impl Into<String>) -> Self {
+        Self::with_config(MockConfig::failure(message))
+    }
+
+    pub fn set_healthy(&self, healthy: bool) {
+        self.is_healthy.store(healthy, Ordering::Relaxed);
+    }
+
+    pub fn get_transactions(&self) -> Vec<String> {
+        self.transactions.lock().unwrap().clone()
+    }
+
+    fn check_should_fail(&self) -> Result<(), AppError> {
+        if self.config.should_fail {
+            let msg = self
+                .config
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "Mock error".to_string());
+            return Err(AppError::Blockchain(BlockchainError::TransactionFailed(
+                msg,
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for MockBlockchainClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl BlockchainClient for MockBlockchainClient {
+    async fn health_check(&self) -> Result<(), AppError> {
+        if !self.is_healthy.load(Ordering::Relaxed) {
+            return Err(AppError::Blockchain(BlockchainError::Connection(
+                "Unhealthy".to_string(),
+            )));
+        }
+        self.check_should_fail()
+    }
+
+    async fn submit_transaction(&self, hash: &str) -> Result<String, AppError> {
+        self.check_should_fail()?;
+        let signature = format!("sig_{}", hash);
+        let mut transactions = self.transactions.lock().unwrap();
+        transactions.push(hash.to_string());
+        Ok(signature)
+    }
+
+    async fn get_transaction_status(&self, signature: &str) -> Result<bool, AppError> {
+        self.check_should_fail()?;
+        let transactions = self.transactions.lock().unwrap();
+        Ok(transactions.iter().any(|t| signature.contains(t)))
+    }
+
+    async fn get_block_height(&self) -> Result<u64, AppError> {
+        self.check_should_fail()?;
+        Ok(12345678)
+    }
+
+    async fn get_latest_blockhash(&self) -> Result<String, AppError> {
+        self.check_should_fail()?;
+        Ok("mock_blockhash_abc123".to_string())
+    }
+
+    async fn wait_for_confirmation(
+        &self,
+        signature: &str,
+        _timeout_secs: u64,
+    ) -> Result<bool, AppError> {
+        self.check_should_fail()?;
+        let transactions = self.transactions.lock().unwrap();
+        Ok(transactions.iter().any(|t| signature.contains(t)))
+    }
+}
+
+===== ./src/test_utils/mod.rs =====
+//! Test utilities and mock implementations.
+
+pub mod mocks;
+
+pub use mocks::{MockBlockchainClient, MockConfig, MockDatabaseClient};
+
+===== ./tests/database_integration.rs =====
+//! Database integration tests using testcontainers.
+//!
+//! These tests require Docker to be running and use testcontainers
+//! to spin up a real PostgreSQL instance.
+
+use testcontainers::{GenericImage, ImageExt, runners::AsyncRunner};
+
+use std::collections::HashMap;
+use testable_rust_architecture_template::domain::{
+    BlockchainStatus, CreateItemRequest, DatabaseClient, ItemMetadataRequest,
+};
+use testable_rust_architecture_template::infra::{PostgresClient, PostgresConfig};
+
+/// Helper to create a PostgreSQL container and client
+async fn setup_postgres() -> (PostgresClient, testcontainers::ContainerAsync<GenericImage>) {
+    let container = GenericImage::new("postgres", "16-alpine")
+        .with_env_var("POSTGRES_DB", "test_db")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .start()
+        .await
+        .expect("Failed to start postgres container");
+
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("Failed to get postgres port");
+
+    let database_url = format!("postgres://postgres:postgres@127.0.0.1:{}/test_db", port);
+
+    // Wait for postgres to be ready
+    let mut attempts = 0;
+    let client = loop {
+        attempts += 1;
+        match PostgresClient::new(&database_url, PostgresConfig::default()).await {
+            Ok(client) => break client,
+            Err(_) if attempts < 30 => {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => panic!("Failed to connect to postgres after 30 attempts: {:?}", e),
+        }
+    };
+
+    // Run migrations
+    client
+        .run_migrations()
+        .await
+        .expect("Failed to run migrations");
+
+    (client, container)
+}
+
+#[tokio::test]
+async fn test_create_and_get_item() {
+    let (client, _container) = setup_postgres().await;
+
+    let request = CreateItemRequest::new("Test Item".to_string(), "Test content".to_string());
+
+    // Create item
+    let created = client
+        .create_item(&request)
+        .await
+        .expect("Failed to create item");
+    assert_eq!(created.name, "Test Item");
+    assert_eq!(created.content, "Test content");
+    assert!(created.id.starts_with("item_"));
+
+    // Get item
+    let fetched = client
+        .get_item(&created.id)
+        .await
+        .expect("Failed to get item")
+        .expect("Item not found");
+
+    assert_eq!(fetched.id, created.id);
+    assert_eq!(fetched.name, created.name);
+    assert_eq!(fetched.content, created.content);
+}
+
+#[tokio::test]
+async fn test_create_item_with_metadata() {
+    let (client, _container) = setup_postgres().await;
+
+    let mut custom_fields = HashMap::new();
+    custom_fields.insert("key1".to_string(), "value1".to_string());
+
+    let request = CreateItemRequest {
+        name: "Item with Metadata".to_string(),
+        description: Some("A description".to_string()),
+        content: "Content here".to_string(),
+        metadata: Some(ItemMetadataRequest {
+            author: Some("John Doe".to_string()),
+            version: Some("1.0.0".to_string()),
+            tags: vec!["tag1".to_string(), "tag2".to_string()],
+            custom_fields,
+        }),
+    };
+
+    let created = client
+        .create_item(&request)
+        .await
+        .expect("Failed to create item");
+    assert_eq!(created.description, Some("A description".to_string()));
+
+    let metadata = created.metadata.expect("Metadata should be present");
+    assert_eq!(metadata.author, Some("John Doe".to_string()));
+    assert_eq!(metadata.version, Some("1.0.0".to_string()));
+    assert_eq!(metadata.tags, vec!["tag1".to_string(), "tag2".to_string()]);
+}
+
+#[tokio::test]
+async fn test_list_items_pagination() {
+    let (client, _container) = setup_postgres().await;
+
+    // Create 5 items
+    for i in 0..5 {
+        let request = CreateItemRequest::new(format!("Item {}", i), format!("Content {}", i));
+        client
+            .create_item(&request)
+            .await
+            .expect("Failed to create item");
+        // Small delay to ensure different timestamps
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Get first page (limit 2)
+    let page1 = client
+        .list_items(2, None)
+        .await
+        .expect("Failed to list items");
+    assert_eq!(page1.items.len(), 2);
+    assert!(page1.has_more);
+    assert!(page1.next_cursor.is_some());
+
+    // Get second page
+    let page2 = client
+        .list_items(2, page1.next_cursor.as_deref())
+        .await
+        .expect("Failed to list items");
+    assert_eq!(page2.items.len(), 2);
+    assert!(page2.has_more);
+
+    // Get third page
+    let page3 = client
+        .list_items(2, page2.next_cursor.as_deref())
+        .await
+        .expect("Failed to list items");
+    assert_eq!(page3.items.len(), 1);
+    assert!(!page3.has_more);
+    assert!(page3.next_cursor.is_none());
+
+    // Verify no duplicates across pages
+    let all_ids: Vec<&str> = page1
+        .items
+        .iter()
+        .chain(page2.items.iter())
+        .chain(page3.items.iter())
+        .map(|i| i.id.as_str())
+        .collect();
+    let unique_ids: std::collections::HashSet<&str> = all_ids.iter().copied().collect();
+    assert_eq!(all_ids.len(), unique_ids.len());
+}
+
+#[tokio::test]
+async fn test_blockchain_status_updates() {
+    let (client, _container) = setup_postgres().await;
+
+    let request = CreateItemRequest::new("Test Item".to_string(), "Content".to_string());
+    let created = client
+        .create_item(&request)
+        .await
+        .expect("Failed to create item");
+    assert_eq!(created.blockchain_status, BlockchainStatus::Pending);
+
+    // Update to pending submission
+    client
+        .update_blockchain_status(
+            &created.id,
+            BlockchainStatus::PendingSubmission,
+            None,
+            Some("Initial error"),
+            Some(chrono::Utc::now()),
+        )
+        .await
+        .expect("Failed to update status");
+
+    let fetched = client
+        .get_item(&created.id)
+        .await
+        .expect("Failed to get item")
+        .expect("Item not found");
+    assert_eq!(
+        fetched.blockchain_status,
+        BlockchainStatus::PendingSubmission
+    );
+    assert_eq!(
+        fetched.blockchain_last_error,
+        Some("Initial error".to_string())
+    );
+
+    // Update to submitted
+    client
+        .update_blockchain_status(
+            &created.id,
+            BlockchainStatus::Submitted,
+            Some("signature123"),
+            None,
+            None,
+        )
+        .await
+        .expect("Failed to update status");
+
+    let fetched = client
+        .get_item(&created.id)
+        .await
+        .expect("Failed to get item")
+        .expect("Item not found");
+    assert_eq!(fetched.blockchain_status, BlockchainStatus::Submitted);
+    assert_eq!(
+        fetched.blockchain_signature,
+        Some("signature123".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_get_pending_blockchain_items() {
+    let (client, _container) = setup_postgres().await;
+
+    // Create items with different statuses
+    for i in 0..3 {
+        let request = CreateItemRequest::new(format!("Item {}", i), "Content".to_string());
+        let item = client
+            .create_item(&request)
+            .await
+            .expect("Failed to create item");
+
+        if i == 0 {
+            // Leave as pending
+        } else if i == 1 {
+            // Set to pending_submission
+            client
+                .update_blockchain_status(
+                    &item.id,
+                    BlockchainStatus::PendingSubmission,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("Failed to update status");
+        } else {
+            // Set to confirmed
+            client
+                .update_blockchain_status(
+                    &item.id,
+                    BlockchainStatus::Confirmed,
+                    Some("sig"),
+                    None,
+                    None,
+                )
+                .await
+                .expect("Failed to update status");
+        }
+    }
+
+    let pending = client
+        .get_pending_blockchain_items(10)
+        .await
+        .expect("Failed to get pending items");
+
+    // Only the item with pending_submission status should be returned
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].blockchain_status,
+        BlockchainStatus::PendingSubmission
+    );
+}
+
+#[tokio::test]
+async fn test_increment_retry_count() {
+    let (client, _container) = setup_postgres().await;
+
+    let request = CreateItemRequest::new("Test Item".to_string(), "Content".to_string());
+    let created = client
+        .create_item(&request)
+        .await
+        .expect("Failed to create item");
+    assert_eq!(created.blockchain_retry_count, 0);
+
+    // Increment retry count
+    let count1 = client
+        .increment_retry_count(&created.id)
+        .await
+        .expect("Failed to increment");
+    assert_eq!(count1, 1);
+
+    let count2 = client
+        .increment_retry_count(&created.id)
+        .await
+        .expect("Failed to increment");
+    assert_eq!(count2, 2);
+
+    // Verify in database
+    let fetched = client
+        .get_item(&created.id)
+        .await
+        .expect("Failed to get item")
+        .expect("Item not found");
+    assert_eq!(fetched.blockchain_retry_count, 2);
+}
+
+#[tokio::test]
+async fn test_health_check() {
+    let (client, _container) = setup_postgres().await;
+
+    let result = client.health_check().await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_get_nonexistent_item() {
+    let (client, _container) = setup_postgres().await;
+
+    let result = client
+        .get_item("nonexistent_id")
+        .await
+        .expect("Query should succeed");
+    assert!(result.is_none());
+}
+
+===== ./tests/integration_test.rs =====
+//! Integration tests for the API.
+
+use std::sync::Arc;
+
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use http_body_util::BodyExt;
+use tower::ServiceExt;
+
+use testable_rust_architecture_template::api::create_router;
+use testable_rust_architecture_template::app::AppState;
+use testable_rust_architecture_template::domain::{
+    BlockchainStatus, CreateItemRequest, HealthResponse, HealthStatus, Item, PaginatedResponse,
+};
+use testable_rust_architecture_template::test_utils::{MockBlockchainClient, MockDatabaseClient};
+
+fn create_test_state() -> Arc<AppState> {
+    let db = Arc::new(MockDatabaseClient::new());
+    let blockchain = Arc::new(MockBlockchainClient::new());
+    Arc::new(AppState::new(db, blockchain))
+}
+
+#[tokio::test]
+async fn test_create_item_success() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let payload = CreateItemRequest::new("Test Item".to_string(), "Content".to_string());
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/items")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let item: Item = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(item.name, "Test Item");
+    assert_eq!(item.blockchain_status, BlockchainStatus::Submitted);
+}
+
+#[tokio::test]
+async fn test_create_item_validation_error() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let payload = CreateItemRequest::new("".to_string(), "Content".to_string());
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/items")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_list_items_empty() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/items")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let result: PaginatedResponse<Item> = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(result.items.is_empty());
+    assert!(!result.has_more);
+    assert!(result.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn test_list_items_with_pagination() {
+    let db = Arc::new(MockDatabaseClient::new());
+    let blockchain = Arc::new(MockBlockchainClient::new());
+    let state = Arc::new(AppState::new(
+        Arc::clone(&db) as _,
+        Arc::clone(&blockchain) as _,
+    ));
+
+    // Create some items
+    for i in 0..5 {
+        let payload = CreateItemRequest::new(format!("Item {}", i), "Content".to_string());
+        state
+            .service
+            .create_and_submit_item(&payload)
+            .await
+            .unwrap();
+    }
+
+    let router = create_router(state);
+
+    // Get first page
+    let request = Request::builder()
+        .method("GET")
+        .uri("/items?limit=2")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let result: PaginatedResponse<Item> = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(result.items.len(), 2);
+    assert!(result.has_more);
+    assert!(result.next_cursor.is_some());
+
+    // Get second page
+    let cursor = result.next_cursor.unwrap();
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/items?limit=2&cursor={}", cursor))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let result: PaginatedResponse<Item> = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(result.items.len(), 2);
+    assert!(result.has_more);
+}
+
+#[tokio::test]
+async fn test_get_item_success() {
+    let db = Arc::new(MockDatabaseClient::new());
+    let blockchain = Arc::new(MockBlockchainClient::new());
+    let state = Arc::new(AppState::new(
+        Arc::clone(&db) as _,
+        Arc::clone(&blockchain) as _,
+    ));
+
+    // Create an item
+    let payload = CreateItemRequest::new("Test Item".to_string(), "Content".to_string());
+    let created_item = state
+        .service
+        .create_and_submit_item(&payload)
+        .await
+        .unwrap();
+
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/items/{}", created_item.id))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let item: Item = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(item.id, created_item.id);
+}
+
+#[tokio::test]
+async fn test_get_item_not_found() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/items/nonexistent_id")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_graceful_degradation_blockchain_failure() {
+    let db = Arc::new(MockDatabaseClient::new());
+    let blockchain = Arc::new(MockBlockchainClient::failing("RPC error"));
+    let state = Arc::new(AppState::new(Arc::clone(&db) as _, blockchain));
+    let router = create_router(state);
+
+    let payload = CreateItemRequest::new("Test".to_string(), "Content".to_string());
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/items")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let item: Item = serde_json::from_slice(&body_bytes).unwrap();
+
+    // Item should be created but with pending_submission status
+    assert_eq!(item.blockchain_status, BlockchainStatus::PendingSubmission);
+    assert!(item.blockchain_last_error.is_some());
+}
+
+#[tokio::test]
+async fn test_health_check() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let health: HealthResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(health.status, HealthStatus::Healthy);
+}
+
+#[tokio::test]
+async fn test_liveness() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/health/live")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_readiness_healthy() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/health/ready")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_readiness_unhealthy() {
+    let db = Arc::new(MockDatabaseClient::new());
+    db.set_healthy(false);
+    let blockchain = Arc::new(MockBlockchainClient::new());
+    let state = Arc::new(AppState::new(db, blockchain));
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/health/ready")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_database_failure() {
+    let db = Arc::new(MockDatabaseClient::failing("DB error"));
+    let blockchain = Arc::new(MockBlockchainClient::new());
+    let state = Arc::new(AppState::new(db, blockchain));
+    let router = create_router(state);
+
+    let payload = CreateItemRequest::new("Test".to_string(), "Content".to_string());
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/items")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_swagger_ui_available() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/swagger-ui/")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    // Swagger UI redirects or returns 200
+    assert!(response.status().is_success() || response.status().is_redirection());
+}
+
+#[tokio::test]
+async fn test_openapi_spec_available() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api-docs/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let spec: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(spec.get("openapi").is_some());
+    assert!(spec.get("paths").is_some());
+}

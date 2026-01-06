@@ -28,12 +28,31 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features postgres
+      - name: Run migrations
+        run: sqlx migrate run --source ./migrations
+
       - run: cargo test --all-features --lib --bins
 
-  # Migration checks
   migrations:
     runs-on: ubuntu-latest
     services:
@@ -60,7 +79,6 @@ jobs:
       - name: Run migrations
         run: sqlx migrate run --source ./migrations
 
-  # Integration tests with real PostgreSQL
   integration-tests:
     runs-on: ubuntu-latest
     services:
@@ -83,7 +101,6 @@ jobs:
       - name: Run integration tests
         run: cargo test --all-features --test integration_test
       
-  # Database integration tests with testcontainers
   database-tests:
     runs-on: ubuntu-latest
     steps:
@@ -99,7 +116,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
 
-  # Build with real-blockchain feature
   build-real-blockchain:
     runs-on: ubuntu-latest
     steps:
@@ -122,9 +138,27 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features postgres
+      - name: Run migrations
+        run: sqlx migrate run --source ./migrations
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin
       - name: Generate code coverage
@@ -136,11 +170,20 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
 
-  # Documentation generation
   docs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: Swatinem/rust-cache@v2
       - name: Build documentation
         run: cargo doc --no-deps --all-features
+
+  bench-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Check benchmarks
+        run: cargo check --bench domain_benchmarks

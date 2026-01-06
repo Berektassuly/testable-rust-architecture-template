@@ -100,6 +100,9 @@ cargo test
 # With coverage
 cargo install cargo-tarpaulin
 cargo tarpaulin --out Html
+
+# Run benchmarks
+cargo bench
 ```
 
 ### Testing with Mocks

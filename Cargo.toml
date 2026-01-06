@@ -55,6 +55,11 @@ http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tokio-test = "0.4"
 testcontainers = "0.26"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "domain_benchmarks"
+harness = false
 
 
 [lib]
