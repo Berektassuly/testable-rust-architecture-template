@@ -639,4 +639,187 @@ mod service_tests {
         assert_eq!(health.database, HealthStatus::Healthy);
         assert_eq!(health.blockchain, HealthStatus::Unhealthy);
     }
+
+    #[tokio::test]
+    async fn test_retry_blockchain_submission_success() {
+        let item = Item {
+            id: "success_id".to_string(),
+            name: "Test".to_string(),
+            content: "Content".to_string(),
+            blockchain_status: BlockchainStatus::PendingSubmission,
+            ..Default::default()
+        };
+
+        let db = Arc::new(ScenarioDatabaseClient {
+            items: Mutex::new(vec![item.clone()]),
+            retry_count_to_return: 0,
+            get_item_response: Some(item),
+        });
+
+        let bc = Arc::new(ScenarioBlockchainClient {
+            should_fail: false,
+            error_to_return: None,
+        });
+
+        let service = AppService::new(db.clone(), bc);
+        let result = service.retry_blockchain_submission("success_id").await;
+
+        assert!(result.is_ok());
+        let updated_item = result.unwrap();
+        assert_eq!(updated_item.blockchain_status, BlockchainStatus::Submitted);
+        assert!(updated_item.blockchain_signature.is_some());
+        assert!(updated_item.blockchain_last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_retry_blockchain_submission_item_not_found() {
+        let db = Arc::new(ScenarioDatabaseClient {
+            items: Mutex::new(vec![]),
+            retry_count_to_return: 0,
+            get_item_response: None,
+        });
+
+        let bc = Arc::new(MockBlockchainClient::new());
+        let service = AppService::new(db, bc);
+
+        let result = service.retry_blockchain_submission("nonexistent").await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::Database(crate::domain::DatabaseError::NotFound(
+                _
+            )))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_retry_blockchain_submission_failed_status() {
+        let item = Item {
+            id: "failed_id".to_string(),
+            name: "Test".to_string(),
+            content: "Content".to_string(),
+            blockchain_status: BlockchainStatus::Failed, // Failed status is eligible
+            ..Default::default()
+        };
+
+        let db = Arc::new(ScenarioDatabaseClient {
+            items: Mutex::new(vec![item.clone()]),
+            retry_count_to_return: 0,
+            get_item_response: Some(item),
+        });
+
+        let bc = Arc::new(ScenarioBlockchainClient {
+            should_fail: false,
+            error_to_return: None,
+        });
+
+        let service = AppService::new(db.clone(), bc);
+        let result = service.retry_blockchain_submission("failed_id").await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_process_pending_submissions_empty() {
+        let db = Arc::new(ScenarioDatabaseClient {
+            items: Mutex::new(vec![]), // No pending items
+            retry_count_to_return: 0,
+            get_item_response: None,
+        });
+
+        let bc = Arc::new(MockBlockchainClient::new());
+        let service = AppService::new(db, bc);
+
+        let count = service.process_pending_submissions(10).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_item_success() {
+        let item = Item {
+            id: "get_id".to_string(),
+            name: "Test Item".to_string(),
+            content: "Content".to_string(),
+            ..Default::default()
+        };
+
+        let db = Arc::new(ScenarioDatabaseClient {
+            items: Mutex::new(vec![item.clone()]),
+            retry_count_to_return: 0,
+            get_item_response: Some(item.clone()),
+        });
+
+        let bc = Arc::new(MockBlockchainClient::new());
+        let service = AppService::new(db, bc);
+
+        let result = service.get_item("get_id").await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, "get_id");
+    }
+
+    #[tokio::test]
+    async fn test_list_items_success() {
+        let db = Arc::new(ScenarioDatabaseClient {
+            items: Mutex::new(vec![]),
+            retry_count_to_return: 0,
+            get_item_response: None,
+        });
+
+        let bc = Arc::new(MockBlockchainClient::new());
+        let service = AppService::new(db, bc);
+
+        let result = service.list_items(10, None).await.unwrap();
+        assert!(result.items.is_empty());
+        assert!(!result.has_more);
+    }
+
+    #[tokio::test]
+    async fn test_create_item_blockchain_success() {
+        let db = Arc::new(ScenarioDatabaseClient {
+            items: Mutex::new(vec![]),
+            retry_count_to_return: 0,
+            get_item_response: None,
+        });
+
+        let bc = Arc::new(ScenarioBlockchainClient {
+            should_fail: false,
+            error_to_return: None,
+        });
+
+        let service = AppService::new(db.clone(), bc);
+        let request = CreateItemRequest {
+            name: "Success Item".to_string(),
+            description: Some("Description".to_string()),
+            content: "Content".to_string(),
+            metadata: None,
+        };
+
+        let result = service.create_and_submit_item(&request).await;
+        assert!(result.is_ok());
+
+        let item = result.unwrap();
+        assert_eq!(item.blockchain_status, BlockchainStatus::Submitted);
+        assert!(item.blockchain_signature.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_health_check_both_healthy() {
+        let db = Arc::new(ScenarioDatabaseClient {
+            items: Mutex::new(vec![]),
+            retry_count_to_return: 0,
+            get_item_response: None,
+        });
+
+        let bc = Arc::new(ScenarioBlockchainClient {
+            should_fail: false,
+            error_to_return: None,
+        });
+
+        let service = AppService::new(db, bc);
+        let health = service.health_check().await;
+
+        assert_eq!(health.status, HealthStatus::Healthy);
+        assert_eq!(health.database, HealthStatus::Healthy);
+        assert_eq!(health.blockchain, HealthStatus::Healthy);
+    }
 }

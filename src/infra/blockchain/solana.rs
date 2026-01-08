@@ -482,4 +482,50 @@ mod tests {
         assert_eq!(config.timeout, Duration::from_secs(30));
         assert_eq!(config.confirmation_timeout, Duration::from_secs(60));
     }
+
+    #[test]
+    fn test_signing_key_from_base58_wrong_length() {
+        // 16 bytes - too short
+        let short_key = bs58::encode(vec![0u8; 16]).into_string();
+        let secret = SecretString::from(short_key);
+        let result = signing_key_from_base58(&secret);
+        assert!(result.is_err());
+
+        // 48 bytes - wrong size (not 32 or 64)
+        let wrong_key = bs58::encode(vec![0u8; 48]).into_string();
+        let secret = SecretString::from(wrong_key);
+        let result = signing_key_from_base58(&secret);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rpc_client_config_custom() {
+        let config = RpcClientConfig {
+            timeout: Duration::from_secs(60),
+            max_retries: 5,
+            retry_delay: Duration::from_millis(1000),
+            confirmation_timeout: Duration::from_secs(120),
+        };
+        assert_eq!(config.timeout, Duration::from_secs(60));
+        assert_eq!(config.max_retries, 5);
+        assert_eq!(config.retry_delay, Duration::from_millis(1000));
+        assert_eq!(config.confirmation_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_signing_determinism() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let client =
+            RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
+                .unwrap();
+
+        // Same message should produce same signature
+        let sig1 = client.sign(b"test message");
+        let sig2 = client.sign(b"test message");
+        assert_eq!(sig1, sig2);
+
+        // Different message should produce different signature
+        let sig3 = client.sign(b"different message");
+        assert_ne!(sig1, sig3);
+    }
 }

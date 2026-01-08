@@ -357,3 +357,34 @@ impl DatabaseClient for PostgresClient {
         Ok(row.get("blockchain_retry_count"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_postgres_config_default() {
+        let config = PostgresConfig::default();
+        assert_eq!(config.max_connections, 10);
+        assert_eq!(config.min_connections, 2);
+        assert_eq!(config.acquire_timeout, Duration::from_secs(3));
+        assert_eq!(config.idle_timeout, Duration::from_secs(600));
+        assert_eq!(config.max_lifetime, Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn test_postgres_config_custom() {
+        let config = PostgresConfig {
+            max_connections: 20,
+            min_connections: 5,
+            acquire_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(300),
+            max_lifetime: Duration::from_secs(3600),
+        };
+        assert_eq!(config.max_connections, 20);
+        assert_eq!(config.min_connections, 5);
+        assert_eq!(config.acquire_timeout, Duration::from_secs(10));
+        assert_eq!(config.idle_timeout, Duration::from_secs(300));
+        assert_eq!(config.max_lifetime, Duration::from_secs(3600));
+    }
+}

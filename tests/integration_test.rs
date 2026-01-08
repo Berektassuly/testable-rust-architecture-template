@@ -335,3 +335,137 @@ async fn test_openapi_spec_available() {
     assert!(spec.get("openapi").is_some());
     assert!(spec.get("paths").is_some());
 }
+
+#[tokio::test]
+async fn test_retry_handler_item_not_found() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/items/nonexistent_id/retry")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_retry_handler_not_eligible() {
+    let db = Arc::new(MockDatabaseClient::new());
+    let blockchain = Arc::new(MockBlockchainClient::new());
+    let state = Arc::new(AppState::new(
+        Arc::clone(&db) as _,
+        Arc::clone(&blockchain) as _,
+    ));
+
+    // Create an item with Submitted status (not eligible for retry)
+    let payload = CreateItemRequest::new("Test Item".to_string(), "Content".to_string());
+    let created_item = state
+        .service
+        .create_and_submit_item(&payload)
+        .await
+        .unwrap();
+
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/items/{}/retry", created_item.id))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    // Item is already submitted, not eligible for retry
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_create_item_malformed_json() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/items")
+        .header("Content-Type", "application/json")
+        .body(Body::from("{ invalid json }"))
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_list_items_invalid_limit() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    // Limit is clamped, so this should still work
+    let request = Request::builder()
+        .method("GET")
+        .uri("/items?limit=999999")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_health_check_degraded() {
+    let db = Arc::new(MockDatabaseClient::new());
+    let blockchain = Arc::new(MockBlockchainClient::new());
+    blockchain.set_healthy(false);
+    let state = Arc::new(AppState::new(db, blockchain));
+    let router = create_router(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let health: HealthResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(health.status, HealthStatus::Unhealthy);
+    assert_eq!(health.database, HealthStatus::Healthy);
+    assert_eq!(health.blockchain, HealthStatus::Unhealthy);
+}
+
+#[tokio::test]
+async fn test_create_item_with_metadata() {
+    let state = create_test_state();
+    let router = create_router(state);
+
+    let payload = serde_json::json!({
+        "name": "Item with Metadata",
+        "content": "Content here",
+        "description": "A description",
+        "metadata": {
+            "author": "Test Author",
+            "version": "1.0.0",
+            "tags": ["tag1", "tag2"],
+            "custom_fields": {"key": "value"}
+        }
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/items")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let item: Item = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(item.name, "Item with Metadata");
+    assert!(item.metadata.is_some());
+}

@@ -547,4 +547,147 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR
         );
     }
+
+    #[test]
+    fn test_error_mapping_database_connection() {
+        let err = AppError::Database(DatabaseError::Connection("timeout".into()));
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn test_error_mapping_database_query() {
+        let err = AppError::Database(DatabaseError::Query("syntax error".into()));
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn test_error_mapping_database_pool_exhausted() {
+        let err = AppError::Database(DatabaseError::PoolExhausted("no connections".into()));
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn test_error_mapping_database_migration() {
+        let err = AppError::Database(DatabaseError::Migration("failed".into()));
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn test_error_mapping_blockchain_connection() {
+        let err = AppError::Blockchain(BlockchainError::Connection("refused".into()));
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn test_error_mapping_blockchain_rpc_error() {
+        let err = AppError::Blockchain(BlockchainError::RpcError("invalid method".into()));
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn test_error_mapping_blockchain_transaction_failed() {
+        let err = AppError::Blockchain(BlockchainError::TransactionFailed("nonce".into()));
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn test_error_mapping_blockchain_invalid_signature() {
+        let err = AppError::Blockchain(BlockchainError::InvalidSignature("corrupt".into()));
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn test_error_mapping_external_service_http_error() {
+        let err = AppError::ExternalService(ExternalServiceError::HttpError("404".into()));
+        assert_eq!(err.into_response().status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_error_mapping_external_service_unavailable() {
+        let err = AppError::ExternalService(ExternalServiceError::Unavailable("down".into()));
+        assert_eq!(err.into_response().status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_error_mapping_external_service_timeout() {
+        let err = AppError::ExternalService(ExternalServiceError::Timeout("30s".into()));
+        assert_eq!(err.into_response().status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[test]
+    fn test_error_mapping_serialization() {
+        let err = AppError::Serialization("json encode".into());
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn test_error_mapping_deserialization() {
+        let err = AppError::Deserialization("invalid json".into());
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_error_mapping_not_supported() {
+        let err = AppError::NotSupported("feature".into());
+        assert_eq!(err.into_response().status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn test_error_mapping_rate_limited() {
+        let err = AppError::RateLimited;
+        assert_eq!(err.into_response().status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn test_readiness_handler_degraded() {
+        // When blockchain is unhealthy but db healthy = degraded (returns OK)
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+        bc.set_healthy(false);
+        let state = Arc::new(AppState::new(db, bc));
+
+        let status = readiness_handler(State(state)).await;
+        // Unhealthy blockchain makes overall status Unhealthy
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_retry_blockchain_handler_not_found() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+        let state = Arc::new(AppState::new(db, bc));
+
+        let result = retry_blockchain_handler(State(state), Path("nonexistent".to_string())).await;
+        assert!(matches!(
+            result,
+            Err(AppError::Database(DatabaseError::NotFound(_)))
+        ));
+    }
 }

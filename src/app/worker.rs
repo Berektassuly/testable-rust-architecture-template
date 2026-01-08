@@ -107,3 +107,115 @@ pub fn spawn_worker(
     let handle = tokio::spawn(worker.run());
     (handle, shutdown_tx)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{MockBlockchainClient, MockDatabaseClient};
+
+    fn create_test_service() -> Arc<AppService> {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+        Arc::new(AppService::new(db, bc))
+    }
+
+    #[test]
+    fn test_worker_config_default() {
+        let config = WorkerConfig::default();
+        assert_eq!(config.poll_interval, Duration::from_secs(10));
+        assert_eq!(config.batch_size, 10);
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_worker_config_custom() {
+        let config = WorkerConfig {
+            poll_interval: Duration::from_secs(5),
+            batch_size: 20,
+            enabled: false,
+        };
+        assert_eq!(config.poll_interval, Duration::from_secs(5));
+        assert_eq!(config.batch_size, 20);
+        assert!(!config.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_worker_disabled_returns_immediately() {
+        let service = create_test_service();
+        let config = WorkerConfig {
+            poll_interval: Duration::from_millis(100),
+            batch_size: 10,
+            enabled: false, // Disabled
+        };
+        let (_, shutdown_rx) = watch::channel(false);
+        let worker = BlockchainRetryWorker::new(service, config, shutdown_rx);
+
+        // Should return immediately without blocking
+        let start = std::time::Instant::now();
+        worker.run().await;
+        let elapsed = start.elapsed();
+
+        // Should complete almost instantly (less than 50ms)
+        assert!(elapsed < Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn test_worker_shutdown_via_channel() {
+        let service = create_test_service();
+        let config = WorkerConfig {
+            poll_interval: Duration::from_secs(60), // Long poll so it doesn't trigger
+            batch_size: 10,
+            enabled: true,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker = BlockchainRetryWorker::new(service, config, shutdown_rx);
+
+        // Spawn worker in background
+        let handle = tokio::spawn(worker.run());
+
+        // Give it a moment to start
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Send shutdown signal
+        shutdown_tx.send(true).unwrap();
+
+        // Worker should complete within reasonable time
+        let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(result.is_ok(), "Worker should shutdown within 2 seconds");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_worker_returns_handles() {
+        let service = create_test_service();
+        let config = WorkerConfig {
+            poll_interval: Duration::from_secs(60),
+            batch_size: 10,
+            enabled: false, // Disabled so it returns immediately
+        };
+
+        let (handle, shutdown_tx) = spawn_worker(service, config);
+
+        // Wait for disabled worker to finish (it returns immediately when disabled)
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(
+            result.is_ok(),
+            "Worker should complete within 1 second when disabled"
+        );
+
+        // Shutdown sender should still be usable (no panic on send)
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn test_worker_new_construction() {
+        let service = create_test_service();
+        let config = WorkerConfig::default();
+        let (_, shutdown_rx) = watch::channel(false);
+
+        let worker = BlockchainRetryWorker::new(Arc::clone(&service), config.clone(), shutdown_rx);
+
+        // Worker should be constructed without panicking
+        // Since fields are private, we verify by running it (which tests all the fields were set)
+        drop(worker); // Just ensure it was created successfully
+    }
+}

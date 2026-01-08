@@ -101,3 +101,115 @@ pub trait BlockchainClient: Send + Sync {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Minimal implementation for testing default methods
+    struct MinimalDatabaseClient;
+
+    #[async_trait]
+    impl DatabaseClient for MinimalDatabaseClient {
+        async fn health_check(&self) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn get_item(&self, _id: &str) -> Result<Option<Item>, AppError> {
+            Ok(None)
+        }
+
+        async fn create_item(&self, _data: &CreateItemRequest) -> Result<Item, AppError> {
+            Ok(Item::default())
+        }
+
+        async fn list_items(
+            &self,
+            _limit: i64,
+            _cursor: Option<&str>,
+        ) -> Result<PaginatedResponse<Item>, AppError> {
+            Ok(PaginatedResponse::empty())
+        }
+
+        async fn update_blockchain_status(
+            &self,
+            _id: &str,
+            _status: BlockchainStatus,
+            _signature: Option<&str>,
+            _error: Option<&str>,
+            _next_retry_at: Option<DateTime<Utc>>,
+        ) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn get_pending_blockchain_items(&self, _limit: i64) -> Result<Vec<Item>, AppError> {
+            Ok(vec![])
+        }
+
+        async fn increment_retry_count(&self, _id: &str) -> Result<i32, AppError> {
+            Ok(1)
+        }
+    }
+
+    struct MinimalBlockchainClient;
+
+    #[async_trait]
+    impl BlockchainClient for MinimalBlockchainClient {
+        async fn health_check(&self) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn submit_transaction(&self, _hash: &str) -> Result<String, AppError> {
+            Ok("sig_123".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_database_client_update_item_not_supported() {
+        let client = MinimalDatabaseClient;
+        let request = CreateItemRequest {
+            name: "test".to_string(),
+            description: None,
+            content: "content".to_string(),
+            metadata: None,
+        };
+
+        let result = client.update_item("id", &request).await;
+        assert!(matches!(result, Err(AppError::NotSupported(_))));
+    }
+
+    #[tokio::test]
+    async fn test_database_client_delete_item_not_supported() {
+        let client = MinimalDatabaseClient;
+        let result = client.delete_item("id").await;
+        assert!(matches!(result, Err(AppError::NotSupported(_))));
+    }
+
+    #[tokio::test]
+    async fn test_blockchain_client_get_transaction_status_not_supported() {
+        let client = MinimalBlockchainClient;
+        let result = client.get_transaction_status("sig").await;
+        assert!(matches!(result, Err(AppError::NotSupported(_))));
+    }
+
+    #[tokio::test]
+    async fn test_blockchain_client_get_block_height_not_supported() {
+        let client = MinimalBlockchainClient;
+        let result = client.get_block_height().await;
+        assert!(matches!(result, Err(AppError::NotSupported(_))));
+    }
+
+    #[tokio::test]
+    async fn test_blockchain_client_get_latest_blockhash_not_supported() {
+        let client = MinimalBlockchainClient;
+        let result = client.get_latest_blockhash().await;
+        assert!(matches!(result, Err(AppError::NotSupported(_))));
+    }
+
+    #[tokio::test]
+    async fn test_blockchain_client_wait_for_confirmation_not_supported() {
+        let client = MinimalBlockchainClient;
+        let result = client.wait_for_confirmation("sig", 30).await;
+        assert!(matches!(result, Err(AppError::NotSupported(_))));
+    }
+}

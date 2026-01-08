@@ -544,4 +544,150 @@ mod tests {
         let res = HealthResponse::new(HealthStatus::Unhealthy, HealthStatus::Healthy);
         assert_eq!(res.status, HealthStatus::Unhealthy);
     }
+
+    #[test]
+    fn test_item_metadata_serialization_roundtrip() {
+        let mut custom_fields = HashMap::new();
+        custom_fields.insert("key1".to_string(), "value1".to_string());
+        custom_fields.insert("key2".to_string(), "value2".to_string());
+
+        let metadata = ItemMetadata {
+            author: Some("John Doe".to_string()),
+            version: Some("1.0.0".to_string()),
+            tags: vec!["rust".to_string(), "test".to_string()],
+            custom_fields,
+        };
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        let deserialized: ItemMetadata = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.author, Some("John Doe".to_string()));
+        assert_eq!(deserialized.version, Some("1.0.0".to_string()));
+        assert_eq!(deserialized.tags, vec!["rust", "test"]);
+        assert_eq!(
+            deserialized.custom_fields.get("key1"),
+            Some(&"value1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_item_metadata_default() {
+        let metadata = ItemMetadata::default();
+        assert!(metadata.author.is_none());
+        assert!(metadata.version.is_none());
+        assert!(metadata.tags.is_empty());
+        assert!(metadata.custom_fields.is_empty());
+    }
+
+    #[test]
+    fn test_error_response_construction() {
+        let error = ErrorResponse {
+            error: ErrorDetail {
+                r#type: "validation_error".to_string(),
+                message: "Name is required".to_string(),
+            },
+        };
+
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(json.contains("validation_error"));
+        assert!(json.contains("Name is required"));
+    }
+
+    #[test]
+    fn test_rate_limit_response_construction() {
+        let response = RateLimitResponse {
+            error: ErrorDetail {
+                r#type: "rate_limited".to_string(),
+                message: "Too many requests".to_string(),
+            },
+            retry_after: 60,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("rate_limited"));
+        assert!(json.contains("60"));
+    }
+
+    #[test]
+    fn test_item_serialization_roundtrip() {
+        let item = Item::new(
+            "item_123".to_string(),
+            "hash_abc".to_string(),
+            "Test Item".to_string(),
+            "Test Content".to_string(),
+        );
+
+        let json = serde_json::to_string(&item).unwrap();
+        let deserialized: Item = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.id, "item_123");
+        assert_eq!(deserialized.hash, "hash_abc");
+        assert_eq!(deserialized.name, "Test Item");
+        assert_eq!(deserialized.content, "Test Content");
+    }
+
+    #[test]
+    fn test_blockchain_status_default() {
+        let status = BlockchainStatus::default();
+        assert_eq!(status, BlockchainStatus::Pending);
+    }
+
+    #[test]
+    fn test_create_item_request_with_all_fields() {
+        let mut req = CreateItemRequest::new("Name".to_string(), "Content".to_string());
+        req.description = Some("Description".to_string());
+        req.metadata = Some(ItemMetadataRequest {
+            author: Some("Author".to_string()),
+            version: Some("1.0".to_string()),
+            tags: vec!["tag1".to_string()],
+            custom_fields: HashMap::new(),
+        });
+
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_pagination_params_with_cursor() {
+        let params = PaginationParams {
+            limit: 50,
+            cursor: Some("item_abc".to_string()),
+        };
+
+        assert!(params.validate().is_ok());
+        assert_eq!(params.cursor, Some("item_abc".to_string()));
+    }
+
+    #[test]
+    fn test_paginated_response_with_items() {
+        let items = vec![
+            Item::default(),
+            Item::new(
+                "id2".to_string(),
+                "hash2".to_string(),
+                "name2".to_string(),
+                "content2".to_string(),
+            ),
+        ];
+        let response = PaginatedResponse::new(items, Some("id2".to_string()), true);
+
+        assert_eq!(response.items.len(), 2);
+        assert_eq!(response.next_cursor, Some("id2".to_string()));
+        assert!(response.has_more);
+    }
+
+    #[test]
+    fn test_health_status_serialization() {
+        assert_eq!(
+            serde_json::to_string(&HealthStatus::Healthy).unwrap(),
+            "\"healthy\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HealthStatus::Degraded).unwrap(),
+            "\"degraded\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HealthStatus::Unhealthy).unwrap(),
+            "\"unhealthy\""
+        );
+    }
 }
