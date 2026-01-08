@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use ed25519_dalek::{Signer, SigningKey};
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
@@ -33,11 +33,111 @@ impl Default for RpcClientConfig {
     }
 }
 
-/// Solana RPC blockchain client
-pub struct RpcBlockchainClient {
+/// Abstract provider for Solana RPC interactions to enable testing
+#[async_trait]
+pub trait SolanaRpcProvider: Send + Sync {
+    /// Send a JSON-RPC request
+    async fn send_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, AppError>;
+
+    /// Get the provider's public key
+    fn public_key(&self) -> String;
+
+    /// Sign a message
+    fn sign(&self, message: &[u8]) -> String;
+}
+
+/// HTTP-based Solana RPC provider
+pub struct HttpSolanaRpcProvider {
     http_client: Client,
     rpc_url: String,
     signing_key: SigningKey,
+}
+
+impl HttpSolanaRpcProvider {
+    pub fn new(
+        rpc_url: &str,
+        signing_key: SigningKey,
+        timeout: Duration,
+    ) -> Result<Self, AppError> {
+        let http_client = Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| AppError::Blockchain(BlockchainError::Connection(e.to_string())))?;
+
+        Ok(Self {
+            http_client,
+            rpc_url: rpc_url.to_string(),
+            signing_key,
+        })
+    }
+}
+
+#[async_trait]
+impl SolanaRpcProvider for HttpSolanaRpcProvider {
+    async fn send_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, AppError> {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: method.to_string(),
+            params,
+        };
+
+        let response = self
+            .http_client
+            .post(&self.rpc_url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    AppError::Blockchain(BlockchainError::Timeout(e.to_string()))
+                } else {
+                    AppError::Blockchain(BlockchainError::RpcError(e.to_string()))
+                }
+            })?;
+
+        let rpc_response: JsonRpcResponse<serde_json::Value> = response
+            .json()
+            .await
+            .map_err(|e| AppError::Blockchain(BlockchainError::RpcError(e.to_string())))?;
+
+        if let Some(error) = rpc_response.error {
+            // Check for insufficient funds error
+            if error.message.contains("insufficient") || error.code == -32002 {
+                return Err(AppError::Blockchain(BlockchainError::InsufficientFunds));
+            }
+            return Err(AppError::Blockchain(BlockchainError::RpcError(format!(
+                "{}: {}",
+                error.code, error.message
+            ))));
+        }
+
+        rpc_response.result.ok_or_else(|| {
+            AppError::Blockchain(BlockchainError::RpcError("Empty response".to_string()))
+        })
+    }
+
+    fn public_key(&self) -> String {
+        bs58::encode(self.signing_key.verifying_key().as_bytes()).into_string()
+    }
+
+    fn sign(&self, message: &[u8]) -> String {
+        let signature = self.signing_key.sign(message);
+        bs58::encode(signature.to_bytes()).into_string()
+    }
+}
+
+/// Solana RPC blockchain client
+pub struct RpcBlockchainClient {
+    provider: Box<dyn SolanaRpcProvider>,
     config: RpcClientConfig,
 }
 
@@ -64,9 +164,6 @@ struct JsonRpcError {
 #[derive(Debug, Deserialize)]
 struct BlockhashResponse {
     blockhash: String,
-    #[serde(rename = "lastValidBlockHeight")]
-    #[allow(dead_code)]
-    last_valid_block_height: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,10 +173,6 @@ struct BlockhashResult {
 
 #[derive(Debug, Deserialize)]
 struct SignatureStatus {
-    #[allow(dead_code)]
-    slot: Option<u64>,
-    #[allow(dead_code)]
-    confirmations: Option<u64>,
     err: Option<serde_json::Value>,
     #[serde(rename = "confirmationStatus")]
     confirmation_status: Option<String>,
@@ -97,15 +190,10 @@ impl RpcBlockchainClient {
         signing_key: SigningKey,
         config: RpcClientConfig,
     ) -> Result<Self, AppError> {
-        let http_client = Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|e| AppError::Blockchain(BlockchainError::Connection(e.to_string())))?;
+        let provider = HttpSolanaRpcProvider::new(rpc_url, signing_key, config.timeout)?;
         info!(rpc_url = %rpc_url, "Created blockchain client");
         Ok(Self {
-            http_client,
-            rpc_url: rpc_url.to_string(),
-            signing_key,
+            provider: Box::new(provider),
             config,
         })
     }
@@ -115,33 +203,57 @@ impl RpcBlockchainClient {
         Self::new(rpc_url, signing_key, RpcClientConfig::default())
     }
 
+    /// Create a new client with a specific provider (useful for testing)
+    pub fn with_provider(provider: Box<dyn SolanaRpcProvider>, config: RpcClientConfig) -> Self {
+        Self { provider, config }
+    }
+
     /// Get the public key as base58 string
     #[must_use]
     pub fn public_key(&self) -> String {
-        bs58::encode(self.signing_key.verifying_key().as_bytes()).into_string()
+        self.provider.public_key()
     }
 
     /// Sign a message and return the signature as base58
     #[must_use]
     pub fn sign(&self, message: &[u8]) -> String {
-        let signature = self.signing_key.sign(message);
-        bs58::encode(signature.to_bytes()).into_string()
+        self.provider.sign(message)
     }
 
     /// Make an RPC call with retries
     #[instrument(skip(self, params))]
-    async fn rpc_call<P: Serialize, R: for<'de> Deserialize<'de>>(
+    async fn rpc_call<P: Serialize + Send + Sync, R: DeserializeOwned + Send>(
         &self,
         method: &str,
         params: P,
     ) -> Result<R, AppError> {
+        // Serialize parameters to JSON Value
+        let params_value = serde_json::to_value(params).map_err(|e| {
+            AppError::Blockchain(BlockchainError::RpcError(format!(
+                "Serialization error: {}",
+                e
+            )))
+        })?;
+
         let mut last_error = None;
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
                 tokio::time::sleep(self.config.retry_delay).await;
             }
-            match self.do_rpc_call(method, &params).await {
-                Ok(result) => return Ok(result),
+            match self
+                .provider
+                .send_request(method, params_value.clone())
+                .await
+            {
+                Ok(result_value) => {
+                    // Deserialize result from JSON Value
+                    return serde_json::from_value(result_value).map_err(|e| {
+                        AppError::Blockchain(BlockchainError::RpcError(format!(
+                            "Deserialization error: {}",
+                            e
+                        )))
+                    });
+                }
                 Err(e) => {
                     warn!(attempt = attempt, error = ?e, method = %method, "RPC call failed");
                     last_error = Some(e);
@@ -151,54 +263,6 @@ impl RpcBlockchainClient {
         Err(last_error.unwrap_or_else(|| {
             AppError::Blockchain(BlockchainError::RpcError("Unknown error".to_string()))
         }))
-    }
-
-    /// Execute a single RPC call
-    async fn do_rpc_call<P: Serialize, R: for<'de> Deserialize<'de>>(
-        &self,
-        method: &str,
-        params: &P,
-    ) -> Result<R, AppError> {
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0",
-            id: 1,
-            method: method.to_string(),
-            params,
-        };
-
-        let response = self
-            .http_client
-            .post(&self.rpc_url)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    AppError::Blockchain(BlockchainError::Timeout(e.to_string()))
-                } else {
-                    AppError::Blockchain(BlockchainError::RpcError(e.to_string()))
-                }
-            })?;
-
-        let rpc_response: JsonRpcResponse<R> = response
-            .json()
-            .await
-            .map_err(|e| AppError::Blockchain(BlockchainError::RpcError(e.to_string())))?;
-
-        if let Some(error) = rpc_response.error {
-            // Check for insufficient funds error
-            if error.message.contains("insufficient") || error.code == -32002 {
-                return Err(AppError::Blockchain(BlockchainError::InsufficientFunds));
-            }
-            return Err(AppError::Blockchain(BlockchainError::RpcError(format!(
-                "{}: {}",
-                error.code, error.message
-            ))));
-        }
-
-        rpc_response.result.ok_or_else(|| {
-            AppError::Blockchain(BlockchainError::RpcError("Empty response".to_string()))
-        })
     }
 
     /// Build and serialize a memo transaction
@@ -217,7 +281,8 @@ impl RpcBlockchainClient {
             .into_vec()
             .map_err(|e| AppError::Blockchain(BlockchainError::InvalidSignature(e.to_string())))?;
 
-        let public_key = self.signing_key.verifying_key().to_bytes();
+        let public_key_bytes: Vec<u8> =
+            bs58::decode(self.provider.public_key()).into_vec().unwrap(); // Should always be valid base58 from provider
 
         // Build a simplified transaction structure
         // This is a minimal memo transaction
@@ -236,7 +301,7 @@ impl RpcBlockchainClient {
 
         // Account keys (payer + memo program)
         tx_data.push(2u8); // num accounts
-        tx_data.extend_from_slice(&public_key);
+        tx_data.extend_from_slice(&public_key_bytes);
         tx_data.extend_from_slice(&memo_program_id);
 
         // Recent blockhash
@@ -258,11 +323,13 @@ impl RpcBlockchainClient {
         // Sign the message (everything after signatures)
         let _message_start = 1 + 64; // 1 byte for sig count, 64 bytes for signature placeholder
         let message = &tx_data[1..]; // Skip signature count
-        let signature = self.signing_key.sign(message);
+
+        let signature_str = self.provider.sign(message);
+        let signature_bytes = bs58::decode(signature_str).into_vec().unwrap();
 
         // Insert signature
         let mut final_tx = vec![1u8]; // signature count
-        final_tx.extend_from_slice(&signature.to_bytes());
+        final_tx.extend_from_slice(&signature_bytes);
         final_tx.extend_from_slice(message);
 
         Ok(bs58::encode(&final_tx).into_string())
@@ -527,5 +594,134 @@ mod tests {
         // Different message should produce different signature
         let sig3 = client.sign(b"different message");
         assert_ne!(sig1, sig3);
+    }
+
+    // --- MOCK PROVIDER TESTS ---
+    use std::sync::Mutex;
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    enum BlockchainErrorType {
+        Timeout,
+        Rpc,
+    }
+
+    struct MockState {
+        requests: Vec<String>,
+        should_fail_count: u32,
+        failure_error: Option<BlockchainErrorType>,
+        next_response: Option<serde_json::Value>,
+    }
+
+    struct MockSolanaRpcProvider {
+        state: Mutex<MockState>,
+        signing_key: SigningKey,
+    }
+
+    impl MockSolanaRpcProvider {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new(MockState {
+                    requests: Vec::new(),
+                    should_fail_count: 0,
+                    failure_error: None,
+                    next_response: None,
+                }),
+                signing_key: SigningKey::generate(&mut OsRng),
+            }
+        }
+
+        fn with_failure(count: u32, error_type: BlockchainErrorType) -> Self {
+            let provider = Self::new(); // removed `mut` since we don’t mutate `provider` itself
+            {
+                let mut state = provider.state.lock().unwrap();
+                state.should_fail_count = count;
+                state.failure_error = Some(error_type);
+            }
+            provider
+        }
+    }
+
+    #[async_trait]
+    impl SolanaRpcProvider for MockSolanaRpcProvider {
+        async fn send_request(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, AppError> {
+            let mut state = self.state.lock().unwrap();
+            state.requests.push(method.to_string());
+
+            if state.should_fail_count > 0 {
+                state.should_fail_count -= 1;
+                if let Some(ref err) = state.failure_error {
+                    return match err {
+                        BlockchainErrorType::Timeout => Err(AppError::Blockchain(
+                            BlockchainError::Timeout("Mock timeout".to_string()),
+                        )),
+                        BlockchainErrorType::Rpc => Err(AppError::Blockchain(
+                            BlockchainError::RpcError("Mock RPC error".to_string()),
+                        )),
+                    };
+                }
+            }
+
+            if let Some(resp) = &state.next_response {
+                return Ok(resp.clone());
+            }
+
+            Ok(serde_json::Value::Null)
+        }
+
+        fn public_key(&self) -> String {
+            bs58::encode(self.signing_key.verifying_key().as_bytes()).into_string()
+        }
+
+        fn sign(&self, message: &[u8]) -> String {
+            let signature = self.signing_key.sign(message);
+            bs58::encode(signature.to_bytes()).into_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rpc_client_retry_logic_success() {
+        // Setup provider that fails twice then succeeds
+        let provider = MockSolanaRpcProvider::with_failure(2, BlockchainErrorType::Timeout);
+        let config = RpcClientConfig {
+            max_retries: 3,
+            retry_delay: Duration::from_millis(1), // Fast retry
+            ..Default::default()
+        };
+
+        // Set success response
+        {
+            let mut state = provider.state.lock().unwrap();
+            state.next_response = Some(serde_json::json!(12345u64)); // Slot response
+        }
+
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        // Call health_check (uses getSlot)
+        let result = client.health_check().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rpc_client_retry_logic_failure() {
+        // Setup provider that fails 4 times (max retries is 3)
+        let provider = MockSolanaRpcProvider::with_failure(4, BlockchainErrorType::Timeout);
+        let config = RpcClientConfig {
+            max_retries: 3,
+            retry_delay: Duration::from_millis(1),
+            ..Default::default()
+        };
+
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.health_check().await;
+        assert!(matches!(
+            result,
+            Err(AppError::Blockchain(BlockchainError::Timeout(_)))
+        ));
     }
 }
