@@ -1,6 +1,7 @@
 # Testable Rust Architecture Template
 
 [![CI](https://github.com/Berektassuly/testable-rust-architecture-template/actions/workflows/ci.yml/badge.svg)](https://github.com/Berektassuly/testable-rust-architecture-template/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Berektassuly/testable-rust-architecture-template/graph/badge.svg?token=YOUR_TOKEN)](https://codecov.io/gh/Berektassuly/testable-rust-architecture-template)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A production-grade reference implementation for building scalable, resilient, and testable backend services in Rust. This template implements Clean Architecture principles with strict layer separation, dependency injection via traits, and robust integration with PostgreSQL and Solana.
@@ -159,6 +160,17 @@ Fast, isolated tests using mocks for database and blockchain clients.
 
 ```bash
 cargo test --lib
+```
+
+### Test Coverage
+Measure code coverage using `tarpaulin`:
+
+```bash
+# Install tarpaulin
+cargo install cargo-tarpaulin
+
+# Run coverage
+cargo tarpaulin --ignore-tests --out Html
 ```
 
 ### Integration Tests
