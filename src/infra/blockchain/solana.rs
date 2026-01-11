@@ -1361,7 +1361,7 @@ mod tests {
         let invalid_keypair = vec![42u8; 64];
         let encoded = bs58::encode(&invalid_keypair).into_string();
         let secret = SecretString::from(encoded);
-        
+
         // This should still work since we only use the first 32 bytes
         let result = signing_key_from_base58(&secret);
         assert!(result.is_ok());
@@ -1383,17 +1383,15 @@ mod tests {
         #[test]
         fn test_build_memo_transaction_success() {
             let signing_key = SigningKey::generate(&mut OsRng);
-            let client = RpcBlockchainClient::with_defaults(
-                "https://api.devnet.solana.com",
-                signing_key,
-            )
-            .unwrap();
+            let client =
+                RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
+                    .unwrap();
 
             // Use a valid base58 blockhash (32 bytes)
             let blockhash = "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTy5nRhVT3";
             let result = client.build_memo_transaction("test_memo", blockhash);
             assert!(result.is_ok());
-            
+
             let tx = result.unwrap();
             // Should be valid base58
             assert!(bs58::decode(&tx).into_vec().is_ok());
@@ -1402,11 +1400,9 @@ mod tests {
         #[test]
         fn test_build_memo_transaction_invalid_blockhash() {
             let signing_key = SigningKey::generate(&mut OsRng);
-            let client = RpcBlockchainClient::with_defaults(
-                "https://api.devnet.solana.com",
-                signing_key,
-            )
-            .unwrap();
+            let client =
+                RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
+                    .unwrap();
 
             // Invalid base58 blockhash
             let result = client.build_memo_transaction("test_memo", "invalid!!!");
@@ -1421,11 +1417,9 @@ mod tests {
             // This test would need a mock RPC server to fully test
             // For now, we just verify the code compiles with the feature
             let signing_key = SigningKey::generate(&mut OsRng);
-            let client = RpcBlockchainClient::with_defaults(
-                "https://api.devnet.solana.com",
-                signing_key,
-            )
-            .unwrap();
+            let client =
+                RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
+                    .unwrap();
 
             // Can't actually test without network, but verify the method exists
             let _ = client.public_key();
@@ -1443,11 +1437,7 @@ mod tests {
             retry_delay: Duration::from_millis(250),
             confirmation_timeout: Duration::from_secs(30),
         };
-        let result = RpcBlockchainClient::new(
-            "https://api.devnet.solana.com",
-            signing_key,
-            config,
-        );
+        let result = RpcBlockchainClient::new("https://api.devnet.solana.com", signing_key, config);
         assert!(result.is_ok());
     }
 
@@ -1456,11 +1446,11 @@ mod tests {
     #[test]
     fn test_provider_as_trait_object() {
         let provider: Box<dyn SolanaRpcProvider> = Box::new(ConfigurableMockProvider::new());
-        
+
         // Test public_key through trait object
         let pubkey = provider.public_key();
         assert!(!pubkey.is_empty());
-        
+
         // Test sign through trait object
         let sig = provider.sign(b"message");
         assert!(!sig.is_empty());
@@ -1474,7 +1464,10 @@ mod tests {
             "blockhash": "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZAMdL4VZHirAn"
         });
         let response: BlockhashResponse = serde_json::from_value(json).unwrap();
-        assert_eq!(response.blockhash, "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZAMdL4VZHirAn");
+        assert_eq!(
+            response.blockhash,
+            "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZAMdL4VZHirAn"
+        );
     }
 
     // --- ADDITIONAL RPC CLIENT CONFIG TESTS ---
@@ -1499,4 +1492,3 @@ mod tests {
         assert_eq!(config.max_retries, 0);
     }
 }
-
