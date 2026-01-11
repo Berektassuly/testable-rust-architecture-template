@@ -49,6 +49,12 @@ impl BlockchainRetryWorker {
         }
     }
 
+    /// Get the configured batch size
+    #[must_use]
+    pub fn batch_size(&self) -> i64 {
+        self.config.batch_size
+    }
+
     /// Run the worker loop
     pub async fn run(mut self) {
         if !self.config.enabled {
@@ -77,8 +83,17 @@ impl BlockchainRetryWorker {
         }
     }
 
+    /// Execute a single tick of the worker loop (for testing)
+    /// This processes one batch without the full loop infrastructure
+    pub async fn run_once(&self) {
+        if !self.config.enabled {
+            return;
+        }
+        self.process_batch().await;
+    }
+
     /// Process a batch of pending submissions
-    async fn process_batch(&self) {
+    pub async fn process_batch(&self) {
         match self
             .service
             .process_pending_submissions(self.config.batch_size)
@@ -111,7 +126,8 @@ pub fn spawn_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{MockBlockchainClient, MockDatabaseClient};
+    use crate::domain::{BlockchainStatus, CreateItemRequest, DatabaseClient};
+    use crate::test_utils::{MockBlockchainClient, MockConfig, MockDatabaseClient};
 
     fn create_test_service() -> Arc<AppService> {
         let db = Arc::new(MockDatabaseClient::new());
@@ -137,6 +153,28 @@ mod tests {
         assert_eq!(config.poll_interval, Duration::from_secs(5));
         assert_eq!(config.batch_size, 20);
         assert!(!config.enabled);
+    }
+
+    #[test]
+    fn test_worker_config_debug() {
+        let config = WorkerConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("WorkerConfig"));
+        assert!(debug_str.contains("poll_interval"));
+        assert!(debug_str.contains("batch_size"));
+    }
+
+    #[test]
+    fn test_worker_config_clone() {
+        let config1 = WorkerConfig {
+            poll_interval: Duration::from_secs(30),
+            batch_size: 50,
+            enabled: true,
+        };
+        let config2 = config1.clone();
+        assert_eq!(config1.poll_interval, config2.poll_interval);
+        assert_eq!(config1.batch_size, config2.batch_size);
+        assert_eq!(config1.enabled, config2.enabled);
     }
 
     #[tokio::test]
@@ -217,5 +255,254 @@ mod tests {
         // Worker should be constructed without panicking
         // Since fields are private, we verify by running it (which tests all the fields were set)
         drop(worker); // Just ensure it was created successfully
+    }
+
+    // --- NEW TESTS: run_once and process_batch ---
+
+    #[tokio::test]
+    async fn test_run_once_disabled_returns_immediately() {
+        let service = create_test_service();
+        let config = WorkerConfig {
+            poll_interval: Duration::from_millis(100),
+            batch_size: 10,
+            enabled: false,
+        };
+        let (_, shutdown_rx) = watch::channel(false);
+        let worker = BlockchainRetryWorker::new(service, config, shutdown_rx);
+
+        let start = std::time::Instant::now();
+        worker.run_once().await;
+        let elapsed = start.elapsed();
+
+        // Should complete instantly when disabled
+        assert!(elapsed < Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn test_run_once_enabled_calls_process_batch() {
+        let service = create_test_service();
+        let config = WorkerConfig {
+            poll_interval: Duration::from_secs(60),
+            batch_size: 5,
+            enabled: true,
+        };
+        let (_, shutdown_rx) = watch::channel(false);
+        let worker = BlockchainRetryWorker::new(service, config, shutdown_rx);
+
+        // run_once should complete without hanging (even with no pending items)
+        let result = tokio::time::timeout(Duration::from_secs(1), worker.run_once()).await;
+        assert!(result.is_ok(), "run_once should complete within 1 second");
+    }
+
+    #[tokio::test]
+    async fn test_batch_size_accessor() {
+        let service = create_test_service();
+        let config = WorkerConfig {
+            poll_interval: Duration::from_secs(10),
+            batch_size: 42,
+            enabled: true,
+        };
+        let (_, shutdown_rx) = watch::channel(false);
+        let worker = BlockchainRetryWorker::new(service, config, shutdown_rx);
+
+        assert_eq!(worker.batch_size(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_with_no_pending_items() {
+        let service = create_test_service();
+        let config = WorkerConfig {
+            poll_interval: Duration::from_secs(10),
+            batch_size: 10,
+            enabled: true,
+        };
+        let (_, shutdown_rx) = watch::channel(false);
+        let worker = BlockchainRetryWorker::new(service, config, shutdown_rx);
+
+        // Should complete without panic when no items
+        worker.process_batch().await;
+    }
+
+    #[tokio::test]
+    async fn test_process_batch_handles_service_error() {
+        // Use a failing database client
+        let db = Arc::new(MockDatabaseClient::with_config(MockConfig::failure(
+            "Database error",
+        )));
+        let bc = Arc::new(MockBlockchainClient::new());
+        let service = Arc::new(AppService::new(db, bc));
+
+        let config = WorkerConfig {
+            poll_interval: Duration::from_secs(10),
+            batch_size: 10,
+            enabled: true,
+        };
+        let (_, shutdown_rx) = watch::channel(false);
+        let worker = BlockchainRetryWorker::new(service, config, shutdown_rx);
+
+        // Should not panic - errors are logged
+        worker.process_batch().await;
+    }
+
+    #[tokio::test]
+    async fn test_worker_with_tokio_time_pause() {
+        tokio::time::pause();
+
+        let service = create_test_service();
+        let config = WorkerConfig {
+            poll_interval: Duration::from_secs(60),
+            batch_size: 10,
+            enabled: true,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker = BlockchainRetryWorker::new(service, config, shutdown_rx);
+
+        let handle = tokio::spawn(worker.run());
+
+        // Advance time past the poll interval
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        // Send shutdown signal
+        shutdown_tx.send(true).unwrap();
+
+        // Worker should shutdown
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_worker_multiple_ticks_with_time_control() {
+        tokio::time::pause();
+
+        let service = create_test_service();
+        let config = WorkerConfig {
+            poll_interval: Duration::from_secs(5),
+            batch_size: 10,
+            enabled: true,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker = BlockchainRetryWorker::new(service, config, shutdown_rx);
+
+        let handle = tokio::spawn(worker.run());
+
+        // Advance through multiple poll intervals
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(6)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Shutdown
+        shutdown_tx.send(true).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_worker_with_enabled_config() {
+        let service = create_test_service();
+        let config = WorkerConfig {
+            poll_interval: Duration::from_secs(60),
+            batch_size: 10,
+            enabled: true,
+        };
+
+        let (handle, shutdown_tx) = spawn_worker(service, config);
+
+        // Give it a moment to start
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Shutdown
+        shutdown_tx.send(true).unwrap();
+
+        // Should complete
+        let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_worker_shutdown_channel_closed() {
+        let service = create_test_service();
+        let config = WorkerConfig {
+            poll_interval: Duration::from_secs(60),
+            batch_size: 10,
+            enabled: true,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker = BlockchainRetryWorker::new(service, config, shutdown_rx);
+
+        let handle = tokio::spawn(worker.run());
+
+        // Drop the sender - this should trigger an error in changed()
+        drop(shutdown_tx);
+
+        // Worker should eventually notice and handle the closed channel
+        // Give it a moment to process
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Cancel the task since it won't shutdown naturally
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_run_once_processes_pending_items() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
+
+        // Create an item that needs processing
+        let request = CreateItemRequest {
+            name: "Test Item".to_string(),
+            description: None,
+            content: "Content".to_string(),
+            metadata: None,
+        };
+        let item = db.create_item(&request).await.unwrap();
+
+        // Update to pending submission status
+        db.update_blockchain_status(
+            &item.id,
+            BlockchainStatus::PendingSubmission,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let service = Arc::new(AppService::new(db.clone(), bc));
+
+        let config = WorkerConfig {
+            poll_interval: Duration::from_secs(10),
+            batch_size: 10,
+            enabled: true,
+        };
+        let (_, shutdown_rx) = watch::channel(false);
+        let worker = BlockchainRetryWorker::new(service, config, shutdown_rx);
+
+        // Process the pending item
+        worker.run_once().await;
+
+        // Verify the item was processed
+        let updated = db.get_item(&item.id).await.unwrap().unwrap();
+        assert_eq!(updated.blockchain_status, BlockchainStatus::Submitted);
+    }
+
+    #[test]
+    fn test_worker_config_zero_batch_size() {
+        let config = WorkerConfig {
+            poll_interval: Duration::from_secs(10),
+            batch_size: 0,
+            enabled: true,
+        };
+        assert_eq!(config.batch_size, 0);
+    }
+
+    #[test]
+    fn test_worker_config_very_short_poll_interval() {
+        let config = WorkerConfig {
+            poll_interval: Duration::from_millis(1),
+            batch_size: 10,
+            enabled: true,
+        };
+        assert_eq!(config.poll_interval, Duration::from_millis(1));
     }
 }

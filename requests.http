@@ -1,0 +1,45 @@
+### Health Checks
+GET http://localhost:3000/health
+Accept: application/json
+
+### Liveness Probe
+GET http://localhost:3000/health/live
+
+### Readiness Probe
+GET http://localhost:3000/health/ready
+
+### Create Item
+# @name createItem
+POST http://localhost:3000/items
+Content-Type: application/json
+
+{
+  "name": "Manual Test Item",
+  "content": "This is content for manual testing",
+  "description": "Optional description",
+  "metadata": {
+    "author": "Antigravity",
+    "version": "1.0.0",
+    "tags": ["testing", "manual"],
+    "custom_fields": {
+      "source": "cli"
+    }
+  }
+}
+
+### List Items
+GET http://localhost:3000/items?limit=10
+Accept: application/json
+
+### Get Item by ID
+# Replace {{id}} with an actual ID from createItem response
+@itemId = {{createItem.response.body.id}}
+GET http://localhost:3000/items/{{itemId}}
+Accept: application/json
+
+### Retry Blockchain Submission
+POST http://localhost:3000/items/{{itemId}}/retry
+Accept: application/json
+
+### OpenAPI Spec
+GET http://localhost:3000/api-docs/openapi.json

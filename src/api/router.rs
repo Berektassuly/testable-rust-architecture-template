@@ -359,10 +359,56 @@ mod tests {
             assert_eq!(config.general_rps, 10);
             assert_eq!(config.general_burst, 20);
         }
+
+        #[test]
+        fn test_rate_limit_config_default_health_values() {
+            let config = RateLimitConfig::default();
+            assert_eq!(config.health_rps, 100);
+            assert_eq!(config.health_burst, 100);
+        }
+
+        #[test]
+        fn test_rate_limit_config_custom() {
+            let config = RateLimitConfig {
+                general_rps: 50,
+                general_burst: 100,
+                health_rps: 200,
+                health_burst: 200,
+            };
+            assert_eq!(config.general_rps, 50);
+            assert_eq!(config.general_burst, 100);
+            assert_eq!(config.health_rps, 200);
+            assert_eq!(config.health_burst, 200);
+        }
+
+        // Note: from_env tests are skipped because std::env::set_var/remove_var
+        // are unsafe in Rust 2024 edition
+
+        #[test]
+        fn test_rate_limit_config_debug() {
+            let config = RateLimitConfig::default();
+            let debug_str = format!("{:?}", config);
+            assert!(debug_str.contains("RateLimitConfig"));
+            assert!(debug_str.contains("general_rps"));
+        }
+
+        #[test]
+        fn test_rate_limit_config_clone() {
+            let config1 = RateLimitConfig {
+                general_rps: 42,
+                general_burst: 84,
+                health_rps: 100,
+                health_burst: 100,
+            };
+            let config2 = config1.clone();
+            assert_eq!(config1.general_rps, config2.general_rps);
+            assert_eq!(config1.general_burst, config2.general_burst);
+        }
     }
 
     mod middleware_tests {
         use super::*;
+        use http_body_util::BodyExt;
 
         async fn dummy_handler() -> impl IntoResponse {
             StatusCode::OK
@@ -398,11 +444,212 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         }
+
+        #[tokio::test]
+        async fn test_rate_limit_success_includes_limit_header() {
+            let config = RateLimitConfig {
+                general_rps: 100,
+                general_burst: 100,
+                ..Default::default()
+            };
+
+            let state = Arc::new(RateLimitState::new(config));
+
+            let app =
+                Router::new()
+                    .route("/", get(dummy_handler))
+                    .layer(middleware::from_fn_with_state(
+                        state,
+                        rate_limit_items_middleware,
+                    ));
+
+            let response = app
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().contains_key("X-RateLimit-Limit"));
+            assert_eq!(response.headers().get("X-RateLimit-Limit").unwrap(), "100");
+        }
+
+        #[tokio::test]
+        async fn test_rate_limit_exceeded_includes_headers() {
+            let config = RateLimitConfig {
+                general_rps: 1,
+                general_burst: 1,
+                ..Default::default()
+            };
+
+            let state = Arc::new(RateLimitState::new(config));
+
+            let app =
+                Router::new()
+                    .route("/", get(dummy_handler))
+                    .layer(middleware::from_fn_with_state(
+                        state,
+                        rate_limit_items_middleware,
+                    ));
+
+            // Exhaust the limit
+            app.clone()
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            // This should be rate limited
+            let response = app
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(response.headers().contains_key("X-RateLimit-Limit"));
+            assert!(response.headers().contains_key("X-RateLimit-Remaining"));
+            assert!(response.headers().contains_key("Retry-After"));
+            assert_eq!(
+                response.headers().get("X-RateLimit-Remaining").unwrap(),
+                "0"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_rate_limit_exceeded_response_body() {
+            let config = RateLimitConfig {
+                general_rps: 1,
+                general_burst: 1,
+                ..Default::default()
+            };
+
+            let state = Arc::new(RateLimitState::new(config));
+
+            let app =
+                Router::new()
+                    .route("/", get(dummy_handler))
+                    .layer(middleware::from_fn_with_state(
+                        state,
+                        rate_limit_items_middleware,
+                    ));
+
+            // Exhaust the limit
+            app.clone()
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            let response = app
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body_str = String::from_utf8_lossy(&body_bytes);
+            assert!(body_str.contains("rate_limited"));
+            assert!(body_str.contains("slow down"));
+        }
+
+        #[tokio::test]
+        async fn test_health_rate_limit_middleware_allows_high_volume() {
+            let config = RateLimitConfig {
+                general_rps: 1,
+                general_burst: 1,
+                health_rps: 100,
+                health_burst: 100,
+            };
+
+            let state = Arc::new(RateLimitState::new(config));
+
+            let app =
+                Router::new()
+                    .route("/", get(dummy_handler))
+                    .layer(middleware::from_fn_with_state(
+                        state,
+                        rate_limit_health_middleware,
+                    ));
+
+            // Should allow multiple requests
+            for _ in 0..10 {
+                let response = app
+                    .clone()
+                    .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+
+        #[tokio::test]
+        async fn test_health_rate_limit_eventually_blocks() {
+            let config = RateLimitConfig {
+                general_rps: 100,
+                general_burst: 100,
+                health_rps: 1,
+                health_burst: 1,
+            };
+
+            let state = Arc::new(RateLimitState::new(config));
+
+            let app =
+                Router::new()
+                    .route("/", get(dummy_handler))
+                    .layer(middleware::from_fn_with_state(
+                        state,
+                        rate_limit_health_middleware,
+                    ));
+
+            // First request should succeed
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            // Second should be blocked
+            let response = app
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        #[tokio::test]
+        async fn test_health_rate_limit_includes_retry_after() {
+            let config = RateLimitConfig {
+                general_rps: 100,
+                general_burst: 100,
+                health_rps: 1,
+                health_burst: 1,
+            };
+
+            let state = Arc::new(RateLimitState::new(config));
+
+            let app =
+                Router::new()
+                    .route("/", get(dummy_handler))
+                    .layer(middleware::from_fn_with_state(
+                        state,
+                        rate_limit_health_middleware,
+                    ));
+
+            // Exhaust
+            app.clone()
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            let response = app
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert!(response.headers().contains_key("Retry-After"));
+        }
     }
 
     mod router_tests {
         use super::*;
-        use crate::app::AppState; // ← ВОТ ТУТ ГЛАВНЫЙ ФИКС
+        use crate::app::AppState;
 
         #[tokio::test]
         async fn test_router_without_rate_limit_routes() {
@@ -420,6 +667,180 @@ mod tests {
                 .unwrap();
 
             assert_eq!(res.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn test_router_health_endpoint() {
+            let app_state = AppState::new_for_test();
+            let router = create_router(app_state);
+
+            let res = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn test_router_readiness_endpoint() {
+            let app_state = AppState::new_for_test();
+            let router = create_router(app_state);
+
+            let res = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/health/ready")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn test_router_items_get_nonexistent() {
+            let app_state = AppState::new_for_test();
+            let router = create_router(app_state);
+
+            let res = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/items/nonexistent-id")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // Should return 404 for non-existent item
+            assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn test_router_with_rate_limit_health_accessible() {
+            let app_state = AppState::new_for_test();
+            let config = RateLimitConfig::default();
+            let router = create_router_with_rate_limit(app_state, config);
+
+            let res = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/health/live")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn test_router_with_rate_limit_items_accessible() {
+            let app_state = AppState::new_for_test();
+            let config = RateLimitConfig::default();
+            let router = create_router_with_rate_limit(app_state, config);
+
+            let res = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/items/test-id")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // Should return 404 (not found), not forbidden or error
+            assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn test_router_with_rate_limit_applies_limits() {
+            let app_state = AppState::new_for_test();
+            let config = RateLimitConfig {
+                general_rps: 1,
+                general_burst: 1,
+                health_rps: 100,
+                health_burst: 100,
+            };
+            let router = create_router_with_rate_limit(app_state, config);
+
+            // First request should succeed
+            let res = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/items/test")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Returns 404 (not found) but that's fine - it means it got through
+            assert!(res.status() == StatusCode::NOT_FOUND || res.status() == StatusCode::OK);
+
+            // Second request should be rate limited
+            let res = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/items/test2")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        #[tokio::test]
+        async fn test_router_swagger_ui_accessible() {
+            let app_state = AppState::new_for_test();
+            let router = create_router(app_state);
+
+            let res = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/swagger-ui/")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // Swagger UI should return 200 OK
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+    }
+
+    mod rate_limit_state_tests {
+        use super::*;
+
+        #[test]
+        fn test_rate_limit_state_creation() {
+            let config = RateLimitConfig::default();
+            let _state = RateLimitState::new(config);
+            // Should not panic
+        }
+
+        #[test]
+        fn test_rate_limit_state_with_custom_config() {
+            let config = RateLimitConfig {
+                general_rps: 50,
+                general_burst: 100,
+                health_rps: 200,
+                health_burst: 400,
+            };
+            let _state = RateLimitState::new(config);
+            // Should not panic with various configurations
         }
     }
 }

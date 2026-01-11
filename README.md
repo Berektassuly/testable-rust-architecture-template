@@ -55,8 +55,9 @@ src/
 ### Prerequisites
 
 *   **Rust:** Latest stable toolchain.
-*   **Docker:** Required for running the local database and executing integration tests via `testcontainers`.
+*   **Docker:** **Required** for running the local database and executing integration tests via `testcontainers`. Ensure Docker Desktop or the Docker daemon is **running**.
 *   **PostgreSQL:** Version 16+ (if running locally without Docker).
+*   **VS Code REST Client:** (Optional) Recommended for manual testing using the provided `requests.http` file.
 
 ### Configuration
 
@@ -75,11 +76,15 @@ src/
 
 ### Database Setup
 
-The easiest way to set up the database is using Docker Compose:
+The quickest way to start the database is using Docker Compose:
 
 ```bash
+# Start the database container in the background
 docker-compose up -d
 ```
+
+> [!TIP]
+> If you encounter a connection error, verify that Docker is running on your machine.
 
 Alternatively, if you want to manage migrations manually or use a local PostgreSQL instance:
 
@@ -97,13 +102,17 @@ Alternatively, if you want to manage migrations manually or use a local PostgreS
 
 ### Running the Application
 
-Start the server:
-
-```bash
-cargo run
-```
-
 By default, the server listens on `http://0.0.0.0:3000`.
+
+### Manual Testing
+
+You can test the API manually using the [requests.http](requests.http) file. If you have the **REST Client** extension for VS Code installed, simply open the file and click **"Send Request"** above any endpoint.
+
+Available manual tests include:
+- Health checks and probes
+- Item creation (POST)
+- Listing and retrieving items (GET)
+- Blockchain submission retries
 
 ## API Documentation
 
@@ -156,8 +165,8 @@ cargo test --lib
 End-to-end API tests and database integration tests. These require Docker as they spin up ephemeral PostgreSQL containers.
 
 ```bash
-# Run API integration tests
-cargo test --test integration_test
+# Run all API integration tests (including lifecycle flows)
+cargo test --test integration_test --test api_requests
 
 # Run Database integration tests
 cargo test --test database_integration

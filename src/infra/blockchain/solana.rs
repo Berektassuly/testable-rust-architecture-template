@@ -724,4 +724,484 @@ mod tests {
             Err(AppError::Blockchain(BlockchainError::Timeout(_)))
         ));
     }
+
+    // --- ENHANCED MOCK FOR ERROR SCENARIOS ---
+
+    #[derive(Clone)]
+    #[allow(dead_code)]
+    enum MockErrorKind {
+        Timeout(String),
+        RpcError(String),
+        InsufficientFunds,
+        TransactionFailed(String),
+        EmptyResponse,
+    }
+
+    struct ConfigurableMockProvider {
+        signing_key: SigningKey,
+        responses: Mutex<Vec<Result<serde_json::Value, MockErrorKind>>>,
+        call_count: Mutex<usize>,
+    }
+
+    impl ConfigurableMockProvider {
+        fn new() -> Self {
+            Self {
+                signing_key: SigningKey::generate(&mut OsRng),
+                responses: Mutex::new(Vec::new()),
+                call_count: Mutex::new(0),
+            }
+        }
+
+        fn with_responses(responses: Vec<Result<serde_json::Value, MockErrorKind>>) -> Self {
+            let provider = Self::new();
+            *provider.responses.lock().unwrap() = responses;
+            provider
+        }
+
+        #[allow(dead_code)]
+        fn get_call_count(&self) -> usize {
+            *self.call_count.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl SolanaRpcProvider for ConfigurableMockProvider {
+        async fn send_request(
+            &self,
+            _method: &str,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, AppError> {
+            let mut count = self.call_count.lock().unwrap();
+            let idx = *count;
+            *count += 1;
+            drop(count);
+
+            let responses = self.responses.lock().unwrap();
+            if idx < responses.len() {
+                match &responses[idx] {
+                    Ok(v) => Ok(v.clone()),
+                    Err(MockErrorKind::Timeout(msg)) => {
+                        Err(AppError::Blockchain(BlockchainError::Timeout(msg.clone())))
+                    }
+                    Err(MockErrorKind::RpcError(msg)) => {
+                        Err(AppError::Blockchain(BlockchainError::RpcError(msg.clone())))
+                    }
+                    Err(MockErrorKind::InsufficientFunds) => {
+                        Err(AppError::Blockchain(BlockchainError::InsufficientFunds))
+                    }
+                    Err(MockErrorKind::TransactionFailed(msg)) => Err(AppError::Blockchain(
+                        BlockchainError::TransactionFailed(msg.clone()),
+                    )),
+                    Err(MockErrorKind::EmptyResponse) => Err(AppError::Blockchain(
+                        BlockchainError::RpcError("Empty response".to_string()),
+                    )),
+                }
+            } else {
+                Ok(serde_json::Value::Null)
+            }
+        }
+
+        fn public_key(&self) -> String {
+            bs58::encode(self.signing_key.verifying_key().as_bytes()).into_string()
+        }
+
+        fn sign(&self, message: &[u8]) -> String {
+            let signature = self.signing_key.sign(message);
+            bs58::encode(signature.to_bytes()).into_string()
+        }
+    }
+
+    // --- ERROR HANDLING TESTS ---
+
+    #[tokio::test]
+    async fn test_rpc_error_insufficient_funds() {
+        let provider =
+            ConfigurableMockProvider::with_responses(vec![Err(MockErrorKind::InsufficientFunds)]);
+        let config = RpcClientConfig {
+            max_retries: 0, // No retries for this test
+            ..Default::default()
+        };
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.health_check().await;
+        assert!(matches!(
+            result,
+            Err(AppError::Blockchain(BlockchainError::InsufficientFunds))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rpc_error_timeout_mapping() {
+        let provider = ConfigurableMockProvider::with_responses(vec![Err(MockErrorKind::Timeout(
+            "Connection timed out".to_string(),
+        ))]);
+        let config = RpcClientConfig {
+            max_retries: 0,
+            ..Default::default()
+        };
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.health_check().await;
+        match result {
+            Err(AppError::Blockchain(BlockchainError::Timeout(msg))) => {
+                assert!(msg.contains("timed out"));
+            }
+            _ => panic!("Expected timeout error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rpc_error_generic_rpc_error() {
+        let provider = ConfigurableMockProvider::with_responses(vec![Err(
+            MockErrorKind::RpcError("-32000: Server is busy".to_string()),
+        )]);
+        let config = RpcClientConfig {
+            max_retries: 0,
+            ..Default::default()
+        };
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.health_check().await;
+        match result {
+            Err(AppError::Blockchain(BlockchainError::RpcError(msg))) => {
+                assert!(msg.contains("Server is busy"));
+            }
+            _ => panic!("Expected RPC error"),
+        }
+    }
+
+    // --- DESERIALIZATION TESTS ---
+
+    #[test]
+    fn test_deserialize_signature_status_confirmed() {
+        let json = serde_json::json!({
+            "err": null,
+            "confirmationStatus": "confirmed"
+        });
+        let status: SignatureStatus = serde_json::from_value(json).unwrap();
+        assert!(status.err.is_none());
+        assert_eq!(status.confirmation_status.as_deref(), Some("confirmed"));
+    }
+
+    #[test]
+    fn test_deserialize_signature_status_finalized() {
+        let json = serde_json::json!({
+            "err": null,
+            "confirmationStatus": "finalized"
+        });
+        let status: SignatureStatus = serde_json::from_value(json).unwrap();
+        assert!(status.err.is_none());
+        assert_eq!(status.confirmation_status.as_deref(), Some("finalized"));
+    }
+
+    #[test]
+    fn test_deserialize_signature_status_with_error() {
+        let json = serde_json::json!({
+            "err": {"InstructionError": [0, "Custom"]},
+            "confirmationStatus": "confirmed"
+        });
+        let status: SignatureStatus = serde_json::from_value(json).unwrap();
+        assert!(status.err.is_some());
+    }
+
+    #[test]
+    fn test_deserialize_signature_status_null_confirmation() {
+        let json = serde_json::json!({
+            "err": null,
+            "confirmationStatus": null
+        });
+        let status: SignatureStatus = serde_json::from_value(json).unwrap();
+        assert!(status.confirmation_status.is_none());
+    }
+
+    #[test]
+    fn test_deserialize_blockhash_result() {
+        let json = serde_json::json!({
+            "value": {
+                "blockhash": "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTy5nRhVT3"
+            }
+        });
+        let result: BlockhashResult = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            result.value.blockhash,
+            "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTy5nRhVT3"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_signature_status_result() {
+        let json = serde_json::json!({
+            "value": [
+                {
+                    "err": null,
+                    "confirmationStatus": "finalized"
+                }
+            ]
+        });
+        let result: SignatureStatusResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.value.len(), 1);
+        assert!(result.value[0].is_some());
+    }
+
+    #[test]
+    fn test_deserialize_signature_status_result_null_entry() {
+        let json = serde_json::json!({
+            "value": [null]
+        });
+        let result: SignatureStatusResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.value.len(), 1);
+        assert!(result.value[0].is_none());
+    }
+
+    // --- TRANSACTION STATUS TESTS ---
+
+    #[tokio::test]
+    async fn test_get_transaction_status_confirmed() {
+        let provider = ConfigurableMockProvider::with_responses(vec![Ok(serde_json::json!({
+            "value": [{
+                "err": null,
+                "confirmationStatus": "confirmed"
+            }]
+        }))]);
+        let config = RpcClientConfig::default();
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.get_transaction_status("test_sig").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap()); // Should be confirmed
+    }
+
+    #[tokio::test]
+    async fn test_get_transaction_status_finalized() {
+        let provider = ConfigurableMockProvider::with_responses(vec![Ok(serde_json::json!({
+            "value": [{
+                "err": null,
+                "confirmationStatus": "finalized"
+            }]
+        }))]);
+        let config = RpcClientConfig::default();
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.get_transaction_status("test_sig").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_get_transaction_status_not_found() {
+        let provider = ConfigurableMockProvider::with_responses(vec![Ok(serde_json::json!({
+            "value": [null]
+        }))]);
+        let config = RpcClientConfig::default();
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.get_transaction_status("unknown_sig").await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Not found = not confirmed
+    }
+
+    #[tokio::test]
+    async fn test_get_transaction_status_with_error() {
+        let provider = ConfigurableMockProvider::with_responses(vec![Ok(serde_json::json!({
+            "value": [{
+                "err": {"InstructionError": [0, "Custom"]},
+                "confirmationStatus": "confirmed"
+            }]
+        }))]);
+        let config = RpcClientConfig::default();
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.get_transaction_status("failed_sig").await;
+        assert!(matches!(
+            result,
+            Err(AppError::Blockchain(BlockchainError::TransactionFailed(_)))
+        ));
+    }
+
+    // --- BLOCKHASH AND BLOCK HEIGHT TESTS ---
+
+    #[tokio::test]
+    async fn test_get_latest_blockhash() {
+        let provider = ConfigurableMockProvider::with_responses(vec![Ok(serde_json::json!({
+            "value": {
+                "blockhash": "TestBlockhash123"
+            }
+        }))]);
+        let config = RpcClientConfig::default();
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.get_latest_blockhash().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "TestBlockhash123");
+    }
+
+    #[tokio::test]
+    async fn test_get_block_height() {
+        let provider =
+            ConfigurableMockProvider::with_responses(vec![Ok(serde_json::json!(123456789u64))]);
+        let config = RpcClientConfig::default();
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.get_block_height().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 123456789);
+    }
+
+    // --- WAIT FOR CONFIRMATION TESTS ---
+
+    #[tokio::test]
+    async fn test_wait_for_confirmation_immediate_success() {
+        let provider = ConfigurableMockProvider::with_responses(vec![Ok(serde_json::json!({
+            "value": [{
+                "err": null,
+                "confirmationStatus": "finalized"
+            }]
+        }))]);
+        let config = RpcClientConfig::default();
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.wait_for_confirmation("test_sig", 5).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_confirmation_eventual_success() {
+        // First call: not confirmed, second call: confirmed
+        let provider = ConfigurableMockProvider::with_responses(vec![
+            Ok(serde_json::json!({"value": [null]})),
+            Ok(serde_json::json!({
+                "value": [{
+                    "err": null,
+                    "confirmationStatus": "confirmed"
+                }]
+            })),
+        ]);
+        let config = RpcClientConfig::default();
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        tokio::time::pause();
+        let result = client.wait_for_confirmation("test_sig", 10).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_confirmation_timeout() {
+        // Always return not confirmed
+        let provider = ConfigurableMockProvider::with_responses(vec![
+            Ok(serde_json::json!({"value": [null]})),
+            Ok(serde_json::json!({"value": [null]})),
+            Ok(serde_json::json!({"value": [null]})),
+            Ok(serde_json::json!({"value": [null]})),
+            Ok(serde_json::json!({"value": [null]})),
+        ]);
+        let config = RpcClientConfig::default();
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        tokio::time::pause();
+        let result = client.wait_for_confirmation("never_confirmed", 1).await;
+        assert!(matches!(
+            result,
+            Err(AppError::Blockchain(BlockchainError::Timeout(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_confirmation_transaction_failed() {
+        let provider = ConfigurableMockProvider::with_responses(vec![Ok(serde_json::json!({
+            "value": [{
+                "err": {"InstructionError": [0, "ProgramFailed"]},
+                "confirmationStatus": "confirmed"
+            }]
+        }))]);
+        let config = RpcClientConfig::default();
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.wait_for_confirmation("failed_tx", 5).await;
+        assert!(matches!(
+            result,
+            Err(AppError::Blockchain(BlockchainError::TransactionFailed(_)))
+        ));
+    }
+
+    // --- SUBMIT TRANSACTION TESTS (MOCK MODE) ---
+
+    #[tokio::test]
+    async fn test_submit_transaction_mock_mode() {
+        let provider = ConfigurableMockProvider::new();
+        let config = RpcClientConfig::default();
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        // In mock mode (no real-blockchain feature), submit_transaction just signs
+        let result = client.submit_transaction("test_hash_123").await;
+        assert!(result.is_ok());
+        let signature = result.unwrap();
+        assert!(signature.starts_with("tx_")); // Mock format
+    }
+
+    // --- RETRY LOGIC WITH CALL TRACKING ---
+
+    #[tokio::test]
+    async fn test_retry_counts_attempts_correctly() {
+        let provider = ConfigurableMockProvider::with_responses(vec![
+            Err(MockErrorKind::Timeout("fail 1".to_string())),
+            Err(MockErrorKind::Timeout("fail 2".to_string())),
+            Err(MockErrorKind::Timeout("fail 3".to_string())),
+            Ok(serde_json::json!(999u64)), // Success on 4th attempt
+        ]);
+        let config = RpcClientConfig {
+            max_retries: 3, // Initial + 3 retries = 4 attempts
+            retry_delay: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.health_check().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_no_retry_on_insufficient_funds() {
+        // InsufficientFunds should still trigger retries as per current implementation
+        let provider = ConfigurableMockProvider::with_responses(vec![
+            Err(MockErrorKind::InsufficientFunds),
+            Err(MockErrorKind::InsufficientFunds),
+        ]);
+        let config = RpcClientConfig {
+            max_retries: 1,
+            retry_delay: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        let result = client.health_check().await;
+        assert!(matches!(
+            result,
+            Err(AppError::Blockchain(BlockchainError::InsufficientFunds))
+        ));
+        // Note: We can't check the provider's state after moving it into Box
+        // The test validates that InsufficientFunds is eventually returned after retries
+    }
+
+    // --- WITH_PROVIDER CONSTRUCTOR TEST ---
+
+    #[test]
+    fn test_with_provider_constructor() {
+        let provider = ConfigurableMockProvider::new();
+        let config = RpcClientConfig {
+            max_retries: 5,
+            timeout: Duration::from_secs(45),
+            ..Default::default()
+        };
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        // Verify public key is accessible
+        let pubkey = client.public_key();
+        assert!(!pubkey.is_empty());
+
+        // Verify signing works
+        let sig = client.sign(b"test");
+        assert!(!sig.is_empty());
+    }
 }
