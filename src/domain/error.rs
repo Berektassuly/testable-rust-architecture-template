@@ -367,4 +367,19 @@ mod tests {
             AppError::Validation(ValidationError::MissingField(_))
         ));
     }
+
+    #[test]
+    fn test_app_error_from_migrate_error() {
+        // Construct a simple MigrateError.
+        // MigrateError::VersionMissing(1) is easy to construct.
+        let mig_err = sqlx::migrate::MigrateError::VersionMissing(1);
+        let app_err: AppError = mig_err.into();
+
+        match app_err {
+            AppError::Database(DatabaseError::Migration(msg)) => {
+                assert!(msg.contains("migration 1 was previously applied"));
+            }
+            _ => panic!("Expected DatabaseError::Migration, got {:?}", app_err),
+        }
+    }
 }
