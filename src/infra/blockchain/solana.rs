@@ -1128,6 +1128,7 @@ mod tests {
     // --- SUBMIT TRANSACTION TESTS (MOCK MODE) ---
 
     #[tokio::test]
+    #[cfg(not(feature = "real-blockchain"))]
     async fn test_submit_transaction_mock_mode() {
         let provider = ConfigurableMockProvider::new();
         let config = RpcClientConfig::default();
