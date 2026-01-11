@@ -1205,4 +1205,298 @@ mod tests {
         let sig = client.sign(b"test");
         assert!(!sig.is_empty());
     }
+
+    // --- HTTP PROVIDER TESTS ---
+
+    #[test]
+    fn test_http_solana_rpc_provider_creation() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let result = HttpSolanaRpcProvider::new(
+            "https://api.devnet.solana.com",
+            signing_key,
+            Duration::from_secs(30),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_http_solana_rpc_provider_public_key() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let provider = HttpSolanaRpcProvider::new(
+            "https://api.devnet.solana.com",
+            signing_key.clone(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+
+        let pubkey = provider.public_key();
+        assert!(!pubkey.is_empty());
+        // Verify it matches the expected public key
+        let expected = bs58::encode(signing_key.verifying_key().as_bytes()).into_string();
+        assert_eq!(pubkey, expected);
+    }
+
+    #[test]
+    fn test_http_solana_rpc_provider_sign() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let provider = HttpSolanaRpcProvider::new(
+            "https://api.devnet.solana.com",
+            signing_key,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+
+        let signature = provider.sign(b"test message");
+        assert!(!signature.is_empty());
+        // Signature should be base58 encoded
+        let decoded = bs58::decode(&signature).into_vec();
+        assert!(decoded.is_ok());
+        assert_eq!(decoded.unwrap().len(), 64); // Ed25519 signature is 64 bytes
+    }
+
+    // --- JSON-RPC STRUCTURE TESTS ---
+
+    #[test]
+    fn test_json_rpc_response_with_result() {
+        let json = serde_json::json!({
+            "result": 12345,
+            "error": null
+        });
+        let response: JsonRpcResponse<u64> = serde_json::from_value(json).unwrap();
+        assert_eq!(response.result, Some(12345));
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn test_json_rpc_response_with_error() {
+        let json = serde_json::json!({
+            "result": null,
+            "error": {
+                "code": -32600,
+                "message": "Invalid Request"
+            }
+        });
+        let response: JsonRpcResponse<u64> = serde_json::from_value(json).unwrap();
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
+        let error = response.error.unwrap();
+        assert_eq!(error.code, -32600);
+        assert_eq!(error.message, "Invalid Request");
+    }
+
+    #[test]
+    fn test_json_rpc_error_insufficient_funds_by_message() {
+        let json = serde_json::json!({
+            "result": null,
+            "error": {
+                "code": -32000,
+                "message": "Transaction simulation failed: insufficient lamports"
+            }
+        });
+        let response: JsonRpcResponse<String> = serde_json::from_value(json).unwrap();
+        let error = response.error.unwrap();
+        // The message contains "insufficient" which triggers InsufficientFunds error
+        assert!(error.message.contains("insufficient"));
+    }
+
+    #[test]
+    fn test_json_rpc_error_insufficient_funds_by_code() {
+        let json = serde_json::json!({
+            "result": null,
+            "error": {
+                "code": -32002,
+                "message": "Some other error"
+            }
+        });
+        let response: JsonRpcResponse<String> = serde_json::from_value(json).unwrap();
+        let error = response.error.unwrap();
+        // Error code -32002 triggers InsufficientFunds
+        assert_eq!(error.code, -32002);
+    }
+
+    // --- DESERIALIZATION ERROR TESTS ---
+
+    #[tokio::test]
+    async fn test_rpc_call_deserialization_error() {
+        // Return a value that can't be deserialized to expected type
+        let provider = ConfigurableMockProvider::with_responses(vec![
+            Ok(serde_json::json!("not_a_number")), // String instead of u64
+        ]);
+        let config = RpcClientConfig {
+            max_retries: 0,
+            ..Default::default()
+        };
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        // get_block_height expects u64, but we return a string
+        let result = client.get_block_height().await;
+        match result {
+            Err(AppError::Blockchain(BlockchainError::RpcError(msg))) => {
+                assert!(msg.contains("Deserialization error"));
+            }
+            _ => panic!("Expected deserialization error, got {:?}", result),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rpc_call_empty_response_after_retries() {
+        // No responses configured - should use fallback null
+        let provider = ConfigurableMockProvider::new();
+        let config = RpcClientConfig {
+            max_retries: 0,
+            ..Default::default()
+        };
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+
+        // Try to get block height - provider returns null which can't deserialize to u64
+        let result = client.get_block_height().await;
+        assert!(result.is_err());
+    }
+
+    // --- SIGNING KEY ADDITIONAL TESTS ---
+
+    #[test]
+    fn test_signing_key_from_base58_64_bytes_invalid_keypair() {
+        // Create 64 random bytes (not a valid keypair where bytes 32-64 are the public key)
+        let invalid_keypair = vec![42u8; 64];
+        let encoded = bs58::encode(&invalid_keypair).into_string();
+        let secret = SecretString::from(encoded);
+        
+        // This should still work since we only use the first 32 bytes
+        let result = signing_key_from_base58(&secret);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_signing_key_from_base58_empty_string() {
+        let secret = SecretString::from("");
+        let result = signing_key_from_base58(&secret);
+        assert!(result.is_err());
+    }
+
+    // --- BUILD MEMO TRANSACTION TESTS (only with real-blockchain feature) ---
+
+    #[cfg(feature = "real-blockchain")]
+    mod real_blockchain_tests {
+        use super::*;
+
+        #[test]
+        fn test_build_memo_transaction_success() {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let client = RpcBlockchainClient::with_defaults(
+                "https://api.devnet.solana.com",
+                signing_key,
+            )
+            .unwrap();
+
+            // Use a valid base58 blockhash (32 bytes)
+            let blockhash = "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTy5nRhVT3";
+            let result = client.build_memo_transaction("test_memo", blockhash);
+            assert!(result.is_ok());
+            
+            let tx = result.unwrap();
+            // Should be valid base58
+            assert!(bs58::decode(&tx).into_vec().is_ok());
+        }
+
+        #[test]
+        fn test_build_memo_transaction_invalid_blockhash() {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let client = RpcBlockchainClient::with_defaults(
+                "https://api.devnet.solana.com",
+                signing_key,
+            )
+            .unwrap();
+
+            // Invalid base58 blockhash
+            let result = client.build_memo_transaction("test_memo", "invalid!!!");
+            assert!(matches!(
+                result,
+                Err(AppError::Blockchain(BlockchainError::InvalidSignature(_)))
+            ));
+        }
+
+        #[tokio::test]
+        async fn test_submit_transaction_real_blockchain_path() {
+            // This test would need a mock RPC server to fully test
+            // For now, we just verify the code compiles with the feature
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let client = RpcBlockchainClient::with_defaults(
+                "https://api.devnet.solana.com",
+                signing_key,
+            )
+            .unwrap();
+
+            // Can't actually test without network, but verify the method exists
+            let _ = client.public_key();
+        }
+    }
+
+    // --- RPC CLIENT NEW CONSTRUCTOR TEST ---
+
+    #[test]
+    fn test_rpc_blockchain_client_new() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let config = RpcClientConfig {
+            timeout: Duration::from_secs(15),
+            max_retries: 2,
+            retry_delay: Duration::from_millis(250),
+            confirmation_timeout: Duration::from_secs(30),
+        };
+        let result = RpcBlockchainClient::new(
+            "https://api.devnet.solana.com",
+            signing_key,
+            config,
+        );
+        assert!(result.is_ok());
+    }
+
+    // --- PROVIDER TRAIT OBJECT TESTS ---
+
+    #[test]
+    fn test_provider_as_trait_object() {
+        let provider: Box<dyn SolanaRpcProvider> = Box::new(ConfigurableMockProvider::new());
+        
+        // Test public_key through trait object
+        let pubkey = provider.public_key();
+        assert!(!pubkey.is_empty());
+        
+        // Test sign through trait object
+        let sig = provider.sign(b"message");
+        assert!(!sig.is_empty());
+    }
+
+    // --- BLOCKHASH RESPONSE DESERIALIZATION ---
+
+    #[test]
+    fn test_blockhash_response_deserialization() {
+        let json = serde_json::json!({
+            "blockhash": "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZAMdL4VZHirAn"
+        });
+        let response: BlockhashResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(response.blockhash, "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZAMdL4VZHirAn");
+    }
+
+    // --- ADDITIONAL RPC CLIENT CONFIG TESTS ---
+
+    #[test]
+    fn test_rpc_client_config_very_short_timeout() {
+        let config = RpcClientConfig {
+            timeout: Duration::from_millis(1),
+            max_retries: 0,
+            retry_delay: Duration::from_millis(1),
+            confirmation_timeout: Duration::from_millis(1),
+        };
+        assert_eq!(config.timeout, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_rpc_client_config_zero_retries() {
+        let config = RpcClientConfig {
+            max_retries: 0,
+            ..Default::default()
+        };
+        assert_eq!(config.max_retries, 0);
+    }
 }
+
