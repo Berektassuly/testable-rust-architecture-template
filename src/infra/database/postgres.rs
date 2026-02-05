@@ -136,8 +136,8 @@ impl DatabaseClient for PostgresClient {
 
     #[instrument(skip(self, data), fields(item_name = %data.name))]
     async fn create_item(&self, data: &CreateItemRequest) -> Result<Item, AppError> {
-        let id = format!("item_{}", uuid::Uuid::new_v4());
-        let hash = format!("hash_{}", uuid::Uuid::new_v4());
+        let id = format!("item_{}", uuid::Uuid::now_v7());
+        let hash = format!("hash_{}", uuid::Uuid::now_v7());
         let now = Utc::now();
 
         let metadata_json = data
@@ -317,16 +317,25 @@ impl DatabaseClient for PostgresClient {
         let now = Utc::now();
         let rows = sqlx::query(
             r#"
-            SELECT id, hash, name, description, content, metadata,
-                   blockchain_status, blockchain_signature, blockchain_retry_count,
-                   blockchain_last_error, blockchain_next_retry_at,
-                   created_at, updated_at
-            FROM items
-            WHERE blockchain_status = 'pending_submission'
-              AND (blockchain_next_retry_at IS NULL OR blockchain_next_retry_at <= $1)
-              AND blockchain_retry_count < 10
-            ORDER BY blockchain_next_retry_at ASC NULLS FIRST, created_at ASC
-            LIMIT $2
+            WITH candidate AS (
+                SELECT id
+                FROM items
+                WHERE blockchain_status = 'pending_submission'
+                  AND (blockchain_next_retry_at IS NULL OR blockchain_next_retry_at <= $1)
+                  AND blockchain_retry_count < 10
+                ORDER BY blockchain_next_retry_at ASC NULLS FIRST, created_at ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE items
+            SET updated_at = $1,
+                blockchain_next_retry_at = $1 + INTERVAL '1 minute'
+            FROM candidate
+            WHERE items.id = candidate.id
+            RETURNING items.id, items.hash, items.name, items.description, items.content, items.metadata,
+                      items.blockchain_status, items.blockchain_signature, items.blockchain_retry_count,
+                      items.blockchain_last_error, items.blockchain_next_retry_at,
+                      items.created_at, items.updated_at
             "#,
         )
         .bind(now)
