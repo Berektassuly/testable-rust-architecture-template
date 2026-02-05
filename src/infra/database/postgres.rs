@@ -328,8 +328,7 @@ impl DatabaseClient for PostgresClient {
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE items
-            SET updated_at = $1,
-                blockchain_next_retry_at = $1 + INTERVAL '1 minute'
+            SET updated_at = $1
             FROM candidate
             WHERE items.id = candidate.id
             RETURNING items.id, items.hash, items.name, items.description, items.content, items.metadata,
