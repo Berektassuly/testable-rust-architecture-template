@@ -10,6 +10,8 @@ pub use error::{
 pub use traits::{BlockchainClient, DatabaseClient};
 pub use types::{
     BlockchainStatus, CreateItemRequest, ErrorDetail, ErrorResponse, HealthResponse, HealthStatus,
-    Item, ItemMetadata, ItemMetadataRequest, PaginatedResponse, PaginationParams,
-    RateLimitResponse,
+    Item, ItemMetadata, ItemMetadataRequest, OutboxStatus, PaginatedResponse, PaginationParams,
+    RateLimitResponse, SolanaOutboxEntry, SolanaOutboxPayload,
+    build_solana_outbox_payload_from_item, build_solana_outbox_payload_from_request,
+    compute_blockchain_hash,
 };

@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(item.name, "Test Item");
         assert_eq!(
             item.blockchain_status,
-            crate::domain::BlockchainStatus::Submitted
+            crate::domain::BlockchainStatus::PendingSubmission
         );
     }
 

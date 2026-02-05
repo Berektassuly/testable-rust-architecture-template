@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::domain::{
     AppError, BlockchainClient, BlockchainError, BlockchainStatus, CreateItemRequest,
-    DatabaseClient, DatabaseError, Item, ItemMetadata, PaginatedResponse,
+    DatabaseClient, DatabaseError, Item, ItemMetadata, OutboxStatus, PaginatedResponse,
+    SolanaOutboxEntry, SolanaOutboxPayload, build_solana_outbox_payload_from_request,
 };
 
 /// Configuration for mock behavior
@@ -36,6 +37,7 @@ impl MockConfig {
 /// Mock database client for testing
 pub struct MockDatabaseClient {
     storage: Arc<Mutex<HashMap<String, Item>>>,
+    outbox: Arc<Mutex<HashMap<String, SolanaOutboxEntry>>>,
     config: MockConfig,
     is_healthy: AtomicBool,
 }
@@ -50,6 +52,7 @@ impl MockDatabaseClient {
     pub fn with_config(config: MockConfig) -> Self {
         Self {
             storage: Arc::new(Mutex::new(HashMap::new())),
+            outbox: Arc::new(Mutex::new(HashMap::new())),
             config,
             is_healthy: AtomicBool::new(true),
         }
@@ -122,7 +125,7 @@ impl DatabaseClient for MockDatabaseClient {
             description: data.description.clone(),
             content: data.content.clone(),
             metadata,
-            blockchain_status: BlockchainStatus::Pending,
+            blockchain_status: BlockchainStatus::PendingSubmission,
             blockchain_signature: None,
             blockchain_retry_count: 0,
             blockchain_last_error: None,
@@ -130,8 +133,18 @@ impl DatabaseClient for MockDatabaseClient {
             created_at: now,
             updated_at: now,
         };
+        let outbox_entry = SolanaOutboxEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            aggregate_id: id.clone(),
+            payload: build_solana_outbox_payload_from_request(&id, data),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            created_at: now,
+        };
         let mut storage = self.storage.lock().unwrap();
         storage.insert(id, item.clone());
+        let mut outbox = self.outbox.lock().unwrap();
+        outbox.insert(outbox_entry.id.clone(), outbox_entry);
         Ok(item)
     }
 
@@ -195,6 +208,125 @@ impl DatabaseClient for MockDatabaseClient {
             item.updated_at = Utc::now();
         }
         Ok(())
+    }
+
+    async fn claim_pending_solana_outbox(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<SolanaOutboxEntry>, AppError> {
+        self.check_should_fail()?;
+        let now = Utc::now();
+        let storage = self.storage.lock().unwrap();
+        let mut outbox = self.outbox.lock().unwrap();
+        let mut entries: Vec<SolanaOutboxEntry> = outbox
+            .values()
+            .filter(|e| e.status == OutboxStatus::Pending)
+            .filter(|e| {
+                storage
+                    .get(&e.aggregate_id)
+                    .map(|i| i.blockchain_next_retry_at.map(|t| t <= now).unwrap_or(true))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        entries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+        let mut selected: Vec<SolanaOutboxEntry> =
+            entries.into_iter().take(limit as usize).collect();
+
+        for entry in &mut selected {
+            entry.status = OutboxStatus::Processing;
+            if let Some(stored) = outbox.get_mut(&entry.id) {
+                stored.status = OutboxStatus::Processing;
+            }
+        }
+
+        Ok(selected)
+    }
+
+    async fn complete_solana_outbox(
+        &self,
+        outbox_id: &str,
+        item_id: &str,
+        signature: &str,
+    ) -> Result<(), AppError> {
+        self.check_should_fail()?;
+        let mut storage = self.storage.lock().unwrap();
+        if let Some(item) = storage.get_mut(item_id) {
+            item.blockchain_status = BlockchainStatus::Submitted;
+            item.blockchain_signature = Some(signature.to_string());
+            item.blockchain_last_error = None;
+            item.blockchain_next_retry_at = None;
+            item.updated_at = Utc::now();
+        }
+        drop(storage);
+
+        let mut outbox = self.outbox.lock().unwrap();
+        if let Some(entry) = outbox.get_mut(outbox_id) {
+            entry.status = OutboxStatus::Completed;
+        }
+        Ok(())
+    }
+
+    async fn fail_solana_outbox(
+        &self,
+        outbox_id: &str,
+        item_id: &str,
+        retry_count: i32,
+        outbox_status: OutboxStatus,
+        item_status: BlockchainStatus,
+        error: &str,
+        next_retry_at: Option<DateTime<Utc>>,
+    ) -> Result<(), AppError> {
+        self.check_should_fail()?;
+        let mut storage = self.storage.lock().unwrap();
+        if let Some(item) = storage.get_mut(item_id) {
+            item.blockchain_status = item_status;
+            item.blockchain_last_error = Some(error.to_string());
+            item.blockchain_next_retry_at = next_retry_at;
+            item.blockchain_retry_count = retry_count;
+            item.updated_at = Utc::now();
+        }
+        drop(storage);
+
+        let mut outbox = self.outbox.lock().unwrap();
+        if let Some(entry) = outbox.get_mut(outbox_id) {
+            entry.status = outbox_status;
+            entry.retry_count = retry_count;
+        }
+        Ok(())
+    }
+
+    async fn enqueue_solana_outbox_for_item(
+        &self,
+        item_id: &str,
+        payload: &SolanaOutboxPayload,
+    ) -> Result<Item, AppError> {
+        self.check_should_fail()?;
+        let now = Utc::now();
+        let mut storage = self.storage.lock().unwrap();
+        let item = storage
+            .get_mut(item_id)
+            .ok_or_else(|| AppError::Database(DatabaseError::NotFound(item_id.to_string())))?;
+
+        let outbox_entry = SolanaOutboxEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            aggregate_id: item_id.to_string(),
+            payload: payload.clone(),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            created_at: now,
+        };
+        let mut outbox = self.outbox.lock().unwrap();
+        outbox.insert(outbox_entry.id.clone(), outbox_entry);
+
+        item.blockchain_status = BlockchainStatus::PendingSubmission;
+        item.blockchain_last_error = None;
+        item.blockchain_next_retry_at = None;
+        item.blockchain_retry_count = 0;
+        item.updated_at = now;
+
+        Ok(item.clone())
     }
 
     async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, AppError> {

@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use utoipa::ToSchema;
 use validator::Validate;
@@ -54,6 +55,76 @@ impl std::fmt::Display for BlockchainStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
     }
+}
+
+/// Status of a Solana outbox record
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxStatus {
+    /// Waiting to be processed
+    #[default]
+    Pending,
+    /// Claimed by a worker
+    Processing,
+    /// Successfully completed
+    Completed,
+    /// Failed after retries
+    Failed,
+}
+
+impl OutboxStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Processing => "processing",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::str::FromStr for OutboxStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "processing" => Ok(Self::Processing),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            _ => Err(format!("Invalid outbox status: {}", s)),
+        }
+    }
+}
+
+impl std::fmt::Display for OutboxStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Payload stored in the Solana outbox
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SolanaOutboxPayload {
+    /// Hash/memo to submit to Solana
+    pub hash: String,
+}
+
+/// Outbox entry for Solana submissions
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SolanaOutboxEntry {
+    /// Unique outbox ID (UUID)
+    pub id: String,
+    /// Item ID (aggregate root)
+    pub aggregate_id: String,
+    /// Submission payload
+    pub payload: SolanaOutboxPayload,
+    /// Processing status
+    pub status: OutboxStatus,
+    /// Retry attempts
+    pub retry_count: i32,
+    /// Creation timestamp
+    pub created_at: DateTime<Utc>,
 }
 
 /// Core item entity
@@ -113,6 +184,52 @@ impl Item {
             updated_at: now,
         }
     }
+}
+
+/// Compute the deterministic blockchain hash used for submission
+#[must_use]
+pub fn compute_blockchain_hash(
+    item_id: &str,
+    name: &str,
+    content: &str,
+    description: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(item_id.as_bytes());
+    hasher.update(name.as_bytes());
+    hasher.update(content.as_bytes());
+    if let Some(desc) = description {
+        hasher.update(desc.as_bytes());
+    }
+    let result = hasher.finalize();
+    result.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Build a Solana outbox payload from a create request
+#[must_use]
+pub fn build_solana_outbox_payload_from_request(
+    item_id: &str,
+    request: &CreateItemRequest,
+) -> SolanaOutboxPayload {
+    let hash = compute_blockchain_hash(
+        item_id,
+        &request.name,
+        &request.content,
+        request.description.as_deref(),
+    );
+    SolanaOutboxPayload { hash }
+}
+
+/// Build a Solana outbox payload from an existing item
+#[must_use]
+pub fn build_solana_outbox_payload_from_item(item: &Item) -> SolanaOutboxPayload {
+    let hash = compute_blockchain_hash(
+        &item.id,
+        &item.name,
+        &item.content,
+        item.description.as_deref(),
+    );
+    SolanaOutboxPayload { hash }
 }
 
 impl Default for Item {

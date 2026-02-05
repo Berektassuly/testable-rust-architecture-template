@@ -7,7 +7,7 @@ use testcontainers::{GenericImage, ImageExt, runners::AsyncRunner};
 
 use std::collections::HashMap;
 use testable_rust_architecture_template::domain::{
-    BlockchainStatus, CreateItemRequest, DatabaseClient, ItemMetadataRequest,
+    BlockchainStatus, CreateItemRequest, DatabaseClient, ItemMetadataRequest, OutboxStatus,
 };
 use testable_rust_architecture_template::infra::{PostgresClient, PostgresConfig};
 
@@ -170,7 +170,10 @@ async fn test_blockchain_status_updates() {
         .create_item(&request)
         .await
         .expect("Failed to create item");
-    assert_eq!(created.blockchain_status, BlockchainStatus::Pending);
+    assert_eq!(
+        created.blockchain_status,
+        BlockchainStatus::PendingSubmission
+    );
 
     // Update to pending submission
     client
@@ -223,57 +226,26 @@ async fn test_blockchain_status_updates() {
 }
 
 #[tokio::test]
-async fn test_get_pending_blockchain_items() {
+async fn test_claim_pending_solana_outbox() {
     let (client, _container) = setup_postgres().await;
 
-    // Create items with different statuses
-    for i in 0..3 {
-        let request = CreateItemRequest::new(format!("Item {}", i), "Content".to_string());
-        let item = client
-            .create_item(&request)
-            .await
-            .expect("Failed to create item");
-
-        if i == 0 {
-            // Leave as pending
-        } else if i == 1 {
-            // Set to pending_submission
-            client
-                .update_blockchain_status(
-                    &item.id,
-                    BlockchainStatus::PendingSubmission,
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                .expect("Failed to update status");
-        } else {
-            // Set to confirmed
-            client
-                .update_blockchain_status(
-                    &item.id,
-                    BlockchainStatus::Confirmed,
-                    Some("sig"),
-                    None,
-                    None,
-                )
-                .await
-                .expect("Failed to update status");
-        }
-    }
+    let request = CreateItemRequest::new("Outbox Item".to_string(), "Content".to_string());
+    let created = client
+        .create_item(&request)
+        .await
+        .expect("Failed to create item");
 
     let pending = client
-        .get_pending_blockchain_items(10)
+        .claim_pending_solana_outbox(10)
         .await
-        .expect("Failed to get pending items");
+        .expect("Failed to claim outbox entries");
 
-    // Only the item with pending_submission status should be returned
     assert_eq!(pending.len(), 1);
-    assert_eq!(
-        pending[0].blockchain_status,
-        BlockchainStatus::PendingSubmission
-    );
+    let entry = &pending[0];
+    assert_eq!(entry.aggregate_id, created.id);
+    assert_eq!(entry.status, OutboxStatus::Processing);
+    assert_eq!(entry.retry_count, 0);
+    assert!(!entry.payload.hash.is_empty());
 }
 
 #[tokio::test]

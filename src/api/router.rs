@@ -276,7 +276,7 @@ mod tests {
         use crate::app::AppState;
         use crate::domain::{
             AppError, BlockchainClient, BlockchainStatus, CreateItemRequest, DatabaseClient, Item,
-            PaginatedResponse,
+            OutboxStatus, PaginatedResponse, SolanaOutboxEntry, SolanaOutboxPayload,
         };
 
         #[derive(Clone)]
@@ -313,6 +313,43 @@ mod tests {
                 _next_retry_at: Option<DateTime<Utc>>,
             ) -> Result<(), AppError> {
                 Ok(())
+            }
+
+            async fn claim_pending_solana_outbox(
+                &self,
+                _limit: i64,
+            ) -> Result<Vec<SolanaOutboxEntry>, AppError> {
+                Ok(vec![])
+            }
+
+            async fn complete_solana_outbox(
+                &self,
+                _outbox_id: &str,
+                _item_id: &str,
+                _signature: &str,
+            ) -> Result<(), AppError> {
+                Ok(())
+            }
+
+            async fn fail_solana_outbox(
+                &self,
+                _outbox_id: &str,
+                _item_id: &str,
+                _retry_count: i32,
+                _outbox_status: OutboxStatus,
+                _item_status: BlockchainStatus,
+                _error: &str,
+                _next_retry_at: Option<DateTime<Utc>>,
+            ) -> Result<(), AppError> {
+                Ok(())
+            }
+
+            async fn enqueue_solana_outbox_for_item(
+                &self,
+                _item_id: &str,
+                _payload: &SolanaOutboxPayload,
+            ) -> Result<Item, AppError> {
+                Ok(Item::default())
             }
 
             async fn get_pending_blockchain_items(

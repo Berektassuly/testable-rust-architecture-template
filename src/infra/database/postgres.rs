@@ -2,13 +2,14 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions, types::Json};
 use std::time::Duration;
 use tracing::{info, instrument};
 
 use crate::domain::{
     AppError, BlockchainStatus, CreateItemRequest, DatabaseClient, DatabaseError, Item,
-    ItemMetadata, PaginatedResponse,
+    ItemMetadata, OutboxStatus, PaginatedResponse, SolanaOutboxEntry, SolanaOutboxPayload,
+    build_solana_outbox_payload_from_request,
 };
 
 /// PostgreSQL connection pool configuration
@@ -98,6 +99,23 @@ impl PostgresClient {
             updated_at: row.get("updated_at"),
         })
     }
+
+    /// Parse a database row into a Solana outbox entry
+    fn row_to_outbox(row: &sqlx::postgres::PgRow) -> Result<SolanaOutboxEntry, AppError> {
+        let payload: Json<SolanaOutboxPayload> = row
+            .try_get("payload")
+            .map_err(|e| AppError::Deserialization(e.to_string()))?;
+        let status_str: String = row.get("status");
+
+        Ok(SolanaOutboxEntry {
+            id: row.get::<uuid::Uuid, _>("id").to_string(),
+            aggregate_id: row.get("aggregate_id"),
+            payload: payload.0,
+            status: status_str.parse().unwrap_or(OutboxStatus::Pending),
+            retry_count: row.get("retry_count"),
+            created_at: row.get("created_at"),
+        })
+    }
 }
 
 #[async_trait]
@@ -139,6 +157,8 @@ impl DatabaseClient for PostgresClient {
         let id = format!("item_{}", uuid::Uuid::now_v7());
         let hash = format!("hash_{}", uuid::Uuid::now_v7());
         let now = Utc::now();
+        let outbox_id = uuid::Uuid::now_v7();
+        let outbox_payload = build_solana_outbox_payload_from_request(&id, data);
 
         let metadata_json = data
             .metadata
@@ -146,6 +166,12 @@ impl DatabaseClient for PostgresClient {
             .map(serde_json::to_value)
             .transpose()
             .map_err(|e| AppError::Serialization(e.to_string()))?;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
 
         sqlx::query(
             r#"
@@ -161,13 +187,33 @@ impl DatabaseClient for PostgresClient {
         .bind(&data.description)
         .bind(&data.content)
         .bind(&metadata_json)
-        .bind(BlockchainStatus::Pending.as_str())
+        .bind(BlockchainStatus::PendingSubmission.as_str())
         .bind(0i32)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO solana_outbox (id, aggregate_id, payload, status, created_at, retry_count)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(outbox_id)
+        .bind(&id)
+        .bind(Json(outbox_payload))
+        .bind(OutboxStatus::Pending.as_str())
+        .bind(now)
+        .bind(0i32)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
 
         let metadata: Option<ItemMetadata> = data.metadata.as_ref().map(|m| ItemMetadata {
             author: m.author.clone(),
@@ -183,7 +229,7 @@ impl DatabaseClient for PostgresClient {
             description: data.description.clone(),
             content: data.content.clone(),
             metadata,
-            blockchain_status: BlockchainStatus::Pending,
+            blockchain_status: BlockchainStatus::PendingSubmission,
             blockchain_signature: None,
             blockchain_retry_count: 0,
             blockchain_last_error: None,
@@ -310,6 +356,213 @@ impl DatabaseClient for PostgresClient {
         .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?;
 
         Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn claim_pending_solana_outbox(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<SolanaOutboxEntry>, AppError> {
+        let now = Utc::now();
+        let rows = sqlx::query(
+            r#"
+            WITH candidate AS (
+                SELECT o.id
+                FROM solana_outbox o
+                JOIN items i ON i.id = o.aggregate_id
+                WHERE o.status = 'pending'
+                  AND (i.blockchain_next_retry_at IS NULL OR i.blockchain_next_retry_at <= $1)
+                ORDER BY o.created_at ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE solana_outbox o
+            SET status = 'processing'
+            FROM candidate
+            WHERE o.id = candidate.id
+            RETURNING o.id, o.aggregate_id, o.payload, o.status, o.retry_count, o.created_at
+            "#,
+        )
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?;
+
+        rows.iter().map(Self::row_to_outbox).collect()
+    }
+
+    #[instrument(skip(self))]
+    async fn complete_solana_outbox(
+        &self,
+        outbox_id: &str,
+        item_id: &str,
+        signature: &str,
+    ) -> Result<(), AppError> {
+        let now = Utc::now();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        sqlx::query(
+            r#"
+            UPDATE solana_outbox
+            SET status = $1
+            WHERE id = $2
+            "#,
+        )
+        .bind(OutboxStatus::Completed.as_str())
+        .bind(outbox_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        sqlx::query(
+            r#"
+            UPDATE items
+            SET blockchain_status = $1,
+                blockchain_signature = $2,
+                blockchain_last_error = NULL,
+                blockchain_next_retry_at = NULL,
+                updated_at = $3
+            WHERE id = $4
+            "#,
+        )
+        .bind(BlockchainStatus::Submitted.as_str())
+        .bind(signature)
+        .bind(now)
+        .bind(item_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn fail_solana_outbox(
+        &self,
+        outbox_id: &str,
+        item_id: &str,
+        retry_count: i32,
+        outbox_status: OutboxStatus,
+        item_status: BlockchainStatus,
+        error: &str,
+        next_retry_at: Option<DateTime<Utc>>,
+    ) -> Result<(), AppError> {
+        let now = Utc::now();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        sqlx::query(
+            r#"
+            UPDATE solana_outbox
+            SET status = $1,
+                retry_count = $2
+            WHERE id = $3
+            "#,
+        )
+        .bind(outbox_status.as_str())
+        .bind(retry_count)
+        .bind(outbox_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        sqlx::query(
+            r#"
+            UPDATE items
+            SET blockchain_status = $1,
+                blockchain_last_error = $2,
+                blockchain_next_retry_at = $3,
+                blockchain_retry_count = $4,
+                updated_at = $5
+            WHERE id = $6
+            "#,
+        )
+        .bind(item_status.as_str())
+        .bind(error)
+        .bind(next_retry_at)
+        .bind(retry_count)
+        .bind(now)
+        .bind(item_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        Ok(())
+    }
+
+    #[instrument(skip(self, payload))]
+    async fn enqueue_solana_outbox_for_item(
+        &self,
+        item_id: &str,
+        payload: &SolanaOutboxPayload,
+    ) -> Result<Item, AppError> {
+        let now = Utc::now();
+        let outbox_id = uuid::Uuid::now_v7();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO solana_outbox (id, aggregate_id, payload, status, created_at, retry_count)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(outbox_id)
+        .bind(item_id)
+        .bind(Json(payload.clone()))
+        .bind(OutboxStatus::Pending.as_str())
+        .bind(now)
+        .bind(0i32)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        let row = sqlx::query(
+            r#"
+            UPDATE items
+            SET blockchain_status = $1,
+                blockchain_last_error = NULL,
+                blockchain_next_retry_at = NULL,
+                blockchain_retry_count = 0,
+                updated_at = $2
+            WHERE id = $3
+            RETURNING id, hash, name, description, content, metadata,
+                      blockchain_status, blockchain_signature, blockchain_retry_count,
+                      blockchain_last_error, blockchain_next_retry_at,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(BlockchainStatus::PendingSubmission.as_str())
+        .bind(now)
+        .bind(item_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+
+        Self::row_to_item(&row)
     }
 
     #[instrument(skip(self))]

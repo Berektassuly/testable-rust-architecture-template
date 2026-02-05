@@ -7,7 +7,8 @@ use validator::Validate;
 
 use crate::domain::{
     AppError, BlockchainClient, BlockchainStatus, CreateItemRequest, DatabaseClient,
-    HealthResponse, HealthStatus, Item, PaginatedResponse, ValidationError,
+    HealthResponse, HealthStatus, Item, OutboxStatus, PaginatedResponse, SolanaOutboxEntry,
+    ValidationError, build_solana_outbox_payload_from_item,
 };
 
 /// Maximum number of retry attempts for blockchain submission
@@ -34,8 +35,7 @@ impl AppService {
         }
     }
 
-    /// Create a new item and attempt blockchain submission.
-    /// If blockchain is unavailable, stores item with pending_submission status.
+    /// Create a new item and enqueue blockchain submission in the outbox.
     #[instrument(skip(self, request), fields(item_name = %request.name))]
     pub async fn create_and_submit_item(
         &self,
@@ -47,44 +47,8 @@ impl AppService {
         })?;
 
         info!("Creating new item: {}", request.name);
-        let mut item = self.db_client.create_item(request).await?;
-        info!(item_id = %item.id, "Item created in database");
-
-        let hash = self.generate_hash(&item);
-
-        // Attempt blockchain submission with graceful degradation
-        match self.blockchain_client.submit_transaction(&hash).await {
-            Ok(signature) => {
-                info!(item_id = %item.id, signature = %signature, "Submitted to blockchain");
-                self.db_client
-                    .update_blockchain_status(
-                        &item.id,
-                        BlockchainStatus::Submitted,
-                        Some(&signature),
-                        None,
-                        None,
-                    )
-                    .await?;
-                item.blockchain_status = BlockchainStatus::Submitted;
-                item.blockchain_signature = Some(signature);
-            }
-            Err(e) => {
-                warn!(item_id = %item.id, error = ?e, "Blockchain submission failed, queuing for retry");
-                let next_retry = Utc::now() + Duration::seconds(1);
-                self.db_client
-                    .update_blockchain_status(
-                        &item.id,
-                        BlockchainStatus::PendingSubmission,
-                        None,
-                        Some(&e.to_string()),
-                        Some(next_retry),
-                    )
-                    .await?;
-                item.blockchain_status = BlockchainStatus::PendingSubmission;
-                item.blockchain_last_error = Some(e.to_string());
-                item.blockchain_next_retry_at = Some(next_retry);
-            }
-        }
+        let item = self.db_client.create_item(request).await?;
+        info!(item_id = %item.id, "Item created and outbox queued");
 
         Ok(item)
     }
@@ -121,57 +85,28 @@ impl AppService {
             }));
         }
 
-        let hash = self.generate_hash(&item);
-
-        match self.blockchain_client.submit_transaction(&hash).await {
-            Ok(signature) => {
-                info!(item_id = %item.id, signature = %signature, "Retry submission successful");
-                self.db_client
-                    .update_blockchain_status(
-                        id,
-                        BlockchainStatus::Submitted,
-                        Some(&signature),
-                        None,
-                        None,
-                    )
-                    .await?;
-                let mut updated_item = item;
-                updated_item.blockchain_status = BlockchainStatus::Submitted;
-                updated_item.blockchain_signature = Some(signature);
-                updated_item.blockchain_last_error = None;
-                updated_item.blockchain_next_retry_at = None;
-                Ok(updated_item)
-            }
-            Err(e) => {
-                warn!(item_id = %item.id, error = ?e, "Retry submission failed");
-                let retry_count = self.db_client.increment_retry_count(id).await?;
-                let (status, next_retry) = if retry_count >= MAX_RETRY_ATTEMPTS {
-                    (BlockchainStatus::Failed, None)
-                } else {
-                    let backoff = calculate_backoff(retry_count);
-                    (
-                        BlockchainStatus::PendingSubmission,
-                        Some(Utc::now() + Duration::seconds(backoff)),
-                    )
-                };
-
-                self.db_client
-                    .update_blockchain_status(id, status, None, Some(&e.to_string()), next_retry)
-                    .await?;
-
-                Err(e)
-            }
+        if item.blockchain_status == BlockchainStatus::PendingSubmission {
+            info!(item_id = %item.id, "Item already queued for submission");
+            return Ok(item);
         }
+
+        let payload = build_solana_outbox_payload_from_item(&item);
+        let updated = self
+            .db_client
+            .enqueue_solana_outbox_for_item(&item.id, &payload)
+            .await?;
+
+        Ok(updated)
     }
 
     /// Process pending blockchain submissions (called by background worker)
     #[instrument(skip(self))]
     pub async fn process_pending_submissions(&self, batch_size: i64) -> Result<usize, AppError> {
-        let pending_items = self
+        let pending_entries = self
             .db_client
-            .get_pending_blockchain_items(batch_size)
+            .claim_pending_solana_outbox(batch_size)
             .await?;
-        let count = pending_items.len();
+        let count = pending_entries.len();
 
         if count == 0 {
             return Ok(0);
@@ -179,9 +114,14 @@ impl AppService {
 
         info!(count = count, "Processing pending blockchain submissions");
 
-        for item in pending_items {
-            if let Err(e) = self.process_single_submission(&item).await {
-                error!(item_id = %item.id, error = ?e, "Failed to process pending submission");
+        for entry in pending_entries {
+            if let Err(e) = self.process_outbox_entry(&entry).await {
+                error!(
+                    outbox_id = %entry.id,
+                    item_id = %entry.aggregate_id,
+                    error = ?e,
+                    "Failed to process pending submission"
+                );
             }
         }
 
@@ -189,41 +129,49 @@ impl AppService {
     }
 
     /// Process a single pending submission
-    async fn process_single_submission(&self, item: &Item) -> Result<(), AppError> {
-        let hash = self.generate_hash(item);
+    async fn process_outbox_entry(&self, entry: &SolanaOutboxEntry) -> Result<(), AppError> {
+        let hash = &entry.payload.hash;
 
         match self.blockchain_client.submit_transaction(&hash).await {
             Ok(signature) => {
-                info!(item_id = %item.id, signature = %signature, "Background submission successful");
+                info!(
+                    outbox_id = %entry.id,
+                    item_id = %entry.aggregate_id,
+                    signature = %signature,
+                    "Background submission successful"
+                );
                 self.db_client
-                    .update_blockchain_status(
-                        &item.id,
-                        BlockchainStatus::Submitted,
-                        Some(&signature),
-                        None,
-                        None,
-                    )
+                    .complete_solana_outbox(&entry.id, &entry.aggregate_id, &signature)
                     .await?;
             }
             Err(e) => {
-                warn!(item_id = %item.id, error = ?e, "Background submission failed");
-                let retry_count = self.db_client.increment_retry_count(&item.id).await?;
-                let (status, next_retry) = if retry_count >= MAX_RETRY_ATTEMPTS {
-                    (BlockchainStatus::Failed, None)
+                warn!(
+                    outbox_id = %entry.id,
+                    item_id = %entry.aggregate_id,
+                    error = ?e,
+                    "Background submission failed"
+                );
+                let retry_count = entry.retry_count + 1;
+                let (outbox_status, item_status, next_retry) = if retry_count >= MAX_RETRY_ATTEMPTS
+                {
+                    (OutboxStatus::Failed, BlockchainStatus::Failed, None)
                 } else {
                     let backoff = calculate_backoff(retry_count);
                     (
+                        OutboxStatus::Pending,
                         BlockchainStatus::PendingSubmission,
                         Some(Utc::now() + Duration::seconds(backoff)),
                     )
                 };
 
                 self.db_client
-                    .update_blockchain_status(
-                        &item.id,
-                        status,
-                        None,
-                        Some(&e.to_string()),
+                    .fail_solana_outbox(
+                        &entry.id,
+                        &entry.aggregate_id,
+                        retry_count,
+                        outbox_status,
+                        item_status,
+                        &e.to_string(),
                         next_retry,
                     )
                     .await?;
@@ -245,20 +193,6 @@ impl AppService {
             Err(_) => HealthStatus::Unhealthy,
         };
         HealthResponse::new(db_health, blockchain_health)
-    }
-
-    /// Generate a content hash for blockchain submission
-    fn generate_hash(&self, item: &Item) -> String {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(item.id.as_bytes());
-        hasher.update(item.name.as_bytes());
-        hasher.update(item.content.as_bytes());
-        if let Some(ref desc) = item.description {
-            hasher.update(desc.as_bytes());
-        }
-        let result = hasher.finalize();
-        result.iter().map(|b| format!("{:02x}", b)).collect()
     }
 }
 
@@ -290,125 +224,10 @@ mod tests {
 #[cfg(test)]
 mod service_tests {
     use super::*;
-    use crate::domain::{BlockchainError, BlockchainStatus, ValidationError};
+    use crate::domain::{BlockchainStatus, ValidationError};
     use crate::test_utils::{MockBlockchainClient, MockDatabaseClient};
-    use async_trait::async_trait;
-    use std::sync::Mutex;
-    // --- Local Mocks for specific scenario testing ---
-    // We define local mocks to have precise control over return values and call tracking
-    // without relying on the generic behavior of test_utils.
-
-    struct ScenarioBlockchainClient {
-        should_fail: bool,
-        error_to_return: Option<BlockchainError>,
-    }
-
-    #[async_trait]
-    impl BlockchainClient for ScenarioBlockchainClient {
-        async fn submit_transaction(&self, _hash: &str) -> Result<String, AppError> {
-            if self.should_fail {
-                let err = self
-                    .error_to_return
-                    .clone()
-                    .unwrap_or(BlockchainError::Connection("Simulated failure".into()));
-                Err(AppError::Blockchain(err))
-            } else {
-                Ok("test_signature".to_string())
-            }
-        }
-
-        async fn health_check(&self) -> Result<(), AppError> {
-            if self.should_fail {
-                Err(AppError::Blockchain(BlockchainError::Connection(
-                    "Unhealthy".into(),
-                )))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    struct ScenarioDatabaseClient {
-        items: Mutex<Vec<Item>>,
-        retry_count_to_return: i32,
-        get_item_response: Option<Item>,
-    }
-
-    #[async_trait]
-    impl DatabaseClient for ScenarioDatabaseClient {
-        async fn create_item(&self, req: &CreateItemRequest) -> Result<Item, AppError> {
-            let item = Item {
-                id: "test_id".to_string(),
-                hash: "test_hash".to_string(),
-                name: req.name.clone(),
-                description: req.description.clone(),
-                content: req.content.clone(),
-                blockchain_status: BlockchainStatus::Pending,
-                blockchain_signature: None,
-                blockchain_last_error: None,
-                blockchain_next_retry_at: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                blockchain_retry_count: 0,
-                metadata: None,
-            };
-            self.items.lock().unwrap().push(item.clone());
-            Ok(item)
-        }
-
-        async fn get_item(&self, _id: &str) -> Result<Option<Item>, AppError> {
-            Ok(self.get_item_response.clone())
-        }
-
-        async fn list_items(
-            &self,
-            _limit: i64,
-            _cursor: Option<&str>,
-        ) -> Result<PaginatedResponse<Item>, AppError> {
-            Ok(PaginatedResponse {
-                items: vec![],
-                next_cursor: None,
-                has_more: false,
-            })
-        }
-
-        async fn update_blockchain_status(
-            &self,
-            id: &str,
-            status: BlockchainStatus,
-            signature: Option<&str>,
-            error: Option<&str>,
-            next_retry: Option<chrono::DateTime<Utc>>,
-        ) -> Result<(), AppError> {
-            let mut items = self.items.lock().unwrap();
-            if let Some(item) = items.iter_mut().find(|i| i.id == id) {
-                item.blockchain_status = status;
-                item.blockchain_signature = signature.map(String::from);
-                item.blockchain_last_error = error.map(String::from);
-                item.blockchain_next_retry_at = next_retry;
-                Ok(())
-            } else {
-                Ok(())
-            }
-        }
-
-        async fn increment_retry_count(&self, _id: &str) -> Result<i32, AppError> {
-            Ok(self.retry_count_to_return)
-        }
-
-        async fn get_pending_blockchain_items(&self, _limit: i64) -> Result<Vec<Item>, AppError> {
-            let items = self.items.lock().unwrap();
-            Ok(items
-                .iter()
-                .filter(|i| i.blockchain_status == BlockchainStatus::PendingSubmission)
-                .cloned()
-                .collect())
-        }
-
-        async fn health_check(&self) -> Result<(), AppError> {
-            Ok(())
-        }
-    }
+    use chrono::Utc;
+    use std::sync::Arc;
 
     // --- Tests ---
 
@@ -432,20 +251,9 @@ mod service_tests {
     }
 
     #[tokio::test]
-    async fn test_create_item_blockchain_failure_graceful_degradation() {
-        // Setup DB that works
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![]),
-            retry_count_to_return: 0,
-            get_item_response: None,
-        });
-
-        // Setup BC that fails
-        let bc = Arc::new(ScenarioBlockchainClient {
-            should_fail: true,
-            error_to_return: Some(BlockchainError::Timeout("Connection timeout".into())),
-        });
-
+    async fn test_create_item_does_not_submit_blockchain() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::failing("Chain down"));
         let service = AppService::new(db, bc);
 
         let request = CreateItemRequest {
@@ -455,43 +263,37 @@ mod service_tests {
             metadata: None,
         };
 
-        // Execution
         let result = service.create_and_submit_item(&request).await;
 
-        // Verification
         assert!(result.is_ok());
         let item = result.unwrap();
 
-        // Should return the item, but with PendingSubmission status instead of Submitted
+        // Item should be queued for submission, no immediate blockchain attempt
         assert_eq!(item.blockchain_status, BlockchainStatus::PendingSubmission);
-        assert!(item.blockchain_last_error.is_some());
-        assert!(item.blockchain_next_retry_at.is_some());
-        assert_eq!(item.blockchain_signature, None);
+        assert!(item.blockchain_signature.is_none());
+        assert!(item.blockchain_last_error.is_none());
+        assert!(item.blockchain_next_retry_at.is_none());
     }
 
     #[tokio::test]
     async fn test_retry_submission_invalid_state() {
-        let mut valid_item = Item::default();
-
-        let _item = Item {
-            id: "retry_id".to_string(),
-            blockchain_status: BlockchainStatus::PendingSubmission,
-            name: "Test".to_string(),
-            content: "Content".to_string(),
-            ..Default::default()
-        };
-
-        valid_item.blockchain_status = BlockchainStatus::Submitted; // Already submitted
-
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![]),
-            retry_count_to_return: 0,
-            get_item_response: Some(valid_item),
-        });
+        let db = Arc::new(MockDatabaseClient::new());
         let bc = Arc::new(MockBlockchainClient::new());
-        let service = AppService::new(db, bc);
+        let service = AppService::new(db.clone(), bc);
 
-        let result = service.retry_blockchain_submission("valid_id").await;
+        let request = CreateItemRequest::new("Test".to_string(), "Content".to_string());
+        let created = db.create_item(&request).await.unwrap();
+        db.update_blockchain_status(
+            &created.id,
+            BlockchainStatus::Submitted,
+            Some("sig"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = service.retry_blockchain_submission(&created.id).await;
 
         match result {
             Err(AppError::Validation(ValidationError::InvalidField { field, .. })) => {
@@ -502,135 +304,63 @@ mod service_tests {
     }
 
     #[tokio::test]
-    async fn test_retry_submission_max_retries_reached() {
-        // Prepare item in DB
-        let item = Item {
-            id: "retry_id".to_string(),
-            name: "Test".to_string(),
-            content: "Content".to_string(),
-            blockchain_status: BlockchainStatus::PendingSubmission,
-            ..Default::default()
-        };
-
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![item.clone()]),
-            retry_count_to_return: 10, // Max retries hit
-            get_item_response: Some(item),
-        });
-
-        // Blockchain continues to fail
-        let bc = Arc::new(ScenarioBlockchainClient {
-            should_fail: true,
-            error_to_return: None,
-        });
-
+    async fn test_retry_submission_failed_requeues() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
         let service = AppService::new(db.clone(), bc);
 
-        let result = service.retry_blockchain_submission("retry_id").await;
+        let request = CreateItemRequest::new("Retry".to_string(), "Content".to_string());
+        let created = db.create_item(&request).await.unwrap();
+        db.update_blockchain_status(
+            &created.id,
+            BlockchainStatus::Failed,
+            None,
+            Some("previous failure"),
+            None,
+        )
+        .await
+        .unwrap();
 
-        assert!(result.is_err()); // Should return the underlying error
-
-        // Verify DB update was called with Failed status
-        let items = db.items.lock().unwrap();
-        let updated_item = items.iter().find(|i| i.id == "retry_id").unwrap();
-        assert_eq!(updated_item.blockchain_status, BlockchainStatus::Failed);
-        assert!(updated_item.blockchain_next_retry_at.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_retry_submission_backoff_calculation() {
-        // Prepare item
-        let item = Item {
-            id: "backoff_id".to_string(),
-            name: "Test".to_string(),
-            content: "Content".to_string(),
-            blockchain_status: BlockchainStatus::PendingSubmission,
-            ..Default::default()
-        };
-
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![item.clone()]),
-            retry_count_to_return: 3, // Should result in 2^3 = 8 seconds
-            get_item_response: Some(item),
-        });
-
-        let bc = Arc::new(ScenarioBlockchainClient {
-            should_fail: true,
-            error_to_return: None,
-        });
-
-        let service = AppService::new(db.clone(), bc);
-
-        let _ = service.retry_blockchain_submission("backoff_id").await;
-
-        let items = db.items.lock().unwrap();
-        let updated_item = items.iter().find(|i| i.id == "backoff_id").unwrap();
-
+        let updated = service
+            .retry_blockchain_submission(&created.id)
+            .await
+            .unwrap();
         assert_eq!(
-            updated_item.blockchain_status,
+            updated.blockchain_status,
             BlockchainStatus::PendingSubmission
         );
-        assert!(updated_item.blockchain_next_retry_at.is_some());
-
-        // Basic check that next_retry is in the future
-        let next = updated_item.blockchain_next_retry_at.unwrap();
-        assert!(next > Utc::now());
+        assert!(updated.blockchain_last_error.is_none());
+        assert!(updated.blockchain_next_retry_at.is_none());
+        assert_eq!(updated.blockchain_retry_count, 0);
     }
 
     #[tokio::test]
     async fn test_process_pending_submissions_batch() {
-        let item1 = Item {
-            id: "1".to_string(),
-            name: "1".to_string(),
-            content: "c".to_string(),
-            blockchain_status: BlockchainStatus::PendingSubmission,
-            ..Default::default()
-        };
-
-        let item2 = Item {
-            id: "2".to_string(),
-            name: "2".to_string(),
-            content: "c".to_string(),
-            blockchain_status: BlockchainStatus::PendingSubmission,
-            ..Default::default()
-        };
-
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![item1, item2]),
-            retry_count_to_return: 0,
-            get_item_response: None,
-        });
-
-        let bc = Arc::new(ScenarioBlockchainClient {
-            should_fail: false,
-            error_to_return: None,
-        });
-
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
         let service = AppService::new(db.clone(), bc);
+
+        let request1 = CreateItemRequest::new("Item1".to_string(), "Content".to_string());
+        let request2 = CreateItemRequest::new("Item2".to_string(), "Content".to_string());
+        let item1 = service.create_and_submit_item(&request1).await.unwrap();
+        let item2 = service.create_and_submit_item(&request2).await.unwrap();
 
         let count = service.process_pending_submissions(10).await.unwrap();
         assert_eq!(count, 2);
 
-        let items = db.items.lock().unwrap();
-        for item in items.iter() {
-            assert_eq!(item.blockchain_status, BlockchainStatus::Submitted);
-            assert!(item.blockchain_signature.is_some());
-        }
+        let updated1 = db.get_item(&item1.id).await.unwrap().unwrap();
+        let updated2 = db.get_item(&item2.id).await.unwrap().unwrap();
+
+        assert_eq!(updated1.blockchain_status, BlockchainStatus::Submitted);
+        assert_eq!(updated2.blockchain_status, BlockchainStatus::Submitted);
+        assert!(updated1.blockchain_signature.is_some());
+        assert!(updated2.blockchain_signature.is_some());
     }
 
     #[tokio::test]
     async fn test_health_check_mixed() {
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![]),
-            retry_count_to_return: 0,
-            get_item_response: None,
-        });
-
-        // Blockchain is down
-        let bc = Arc::new(ScenarioBlockchainClient {
-            should_fail: true,
-            error_to_return: None,
-        });
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::failing("unhealthy"));
 
         let service = AppService::new(db, bc);
         let health = service.health_check().await;
@@ -641,44 +371,8 @@ mod service_tests {
     }
 
     #[tokio::test]
-    async fn test_retry_blockchain_submission_success() {
-        let item = Item {
-            id: "success_id".to_string(),
-            name: "Test".to_string(),
-            content: "Content".to_string(),
-            blockchain_status: BlockchainStatus::PendingSubmission,
-            ..Default::default()
-        };
-
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![item.clone()]),
-            retry_count_to_return: 0,
-            get_item_response: Some(item),
-        });
-
-        let bc = Arc::new(ScenarioBlockchainClient {
-            should_fail: false,
-            error_to_return: None,
-        });
-
-        let service = AppService::new(db.clone(), bc);
-        let result = service.retry_blockchain_submission("success_id").await;
-
-        assert!(result.is_ok());
-        let updated_item = result.unwrap();
-        assert_eq!(updated_item.blockchain_status, BlockchainStatus::Submitted);
-        assert!(updated_item.blockchain_signature.is_some());
-        assert!(updated_item.blockchain_last_error.is_none());
-    }
-
-    #[tokio::test]
     async fn test_retry_blockchain_submission_item_not_found() {
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![]),
-            retry_count_to_return: 0,
-            get_item_response: None,
-        });
-
+        let db = Arc::new(MockDatabaseClient::new());
         let bc = Arc::new(MockBlockchainClient::new());
         let service = AppService::new(db, bc);
 
@@ -694,39 +388,34 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_retry_blockchain_submission_failed_status() {
-        let item = Item {
-            id: "failed_id".to_string(),
-            name: "Test".to_string(),
-            content: "Content".to_string(),
-            blockchain_status: BlockchainStatus::Failed, // Failed status is eligible
-            ..Default::default()
-        };
-
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![item.clone()]),
-            retry_count_to_return: 0,
-            get_item_response: Some(item),
-        });
-
-        let bc = Arc::new(ScenarioBlockchainClient {
-            should_fail: false,
-            error_to_return: None,
-        });
-
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
         let service = AppService::new(db.clone(), bc);
-        let result = service.retry_blockchain_submission("failed_id").await;
 
+        let request = CreateItemRequest::new("Failed".to_string(), "Content".to_string());
+        let created = db.create_item(&request).await.unwrap();
+        db.update_blockchain_status(
+            &created.id,
+            BlockchainStatus::Failed,
+            None,
+            Some("failed"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = service.retry_blockchain_submission(&created.id).await;
         assert!(result.is_ok());
+        let updated = result.unwrap();
+        assert_eq!(
+            updated.blockchain_status,
+            BlockchainStatus::PendingSubmission
+        );
     }
 
     #[tokio::test]
     async fn test_process_pending_submissions_empty() {
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![]), // No pending items
-            retry_count_to_return: 0,
-            get_item_response: None,
-        });
-
+        let db = Arc::new(MockDatabaseClient::new());
         let bc = Arc::new(MockBlockchainClient::new());
         let service = AppService::new(db, bc);
 
@@ -736,35 +425,21 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_get_item_success() {
-        let item = Item {
-            id: "get_id".to_string(),
-            name: "Test Item".to_string(),
-            content: "Content".to_string(),
-            ..Default::default()
-        };
-
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![item.clone()]),
-            retry_count_to_return: 0,
-            get_item_response: Some(item.clone()),
-        });
-
+        let db = Arc::new(MockDatabaseClient::new());
         let bc = Arc::new(MockBlockchainClient::new());
         let service = AppService::new(db, bc);
 
-        let result = service.get_item("get_id").await.unwrap();
+        let request = CreateItemRequest::new("Test Item".to_string(), "Content".to_string());
+        let created = service.create_and_submit_item(&request).await.unwrap();
+
+        let result = service.get_item(&created.id).await.unwrap();
         assert!(result.is_some());
-        assert_eq!(result.unwrap().id, "get_id");
+        assert_eq!(result.unwrap().id, created.id);
     }
 
     #[tokio::test]
     async fn test_list_items_success() {
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![]),
-            retry_count_to_return: 0,
-            get_item_response: None,
-        });
-
+        let db = Arc::new(MockDatabaseClient::new());
         let bc = Arc::new(MockBlockchainClient::new());
         let service = AppService::new(db, bc);
 
@@ -775,17 +450,8 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_create_item_blockchain_success() {
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![]),
-            retry_count_to_return: 0,
-            get_item_response: None,
-        });
-
-        let bc = Arc::new(ScenarioBlockchainClient {
-            should_fail: false,
-            error_to_return: None,
-        });
-
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
         let service = AppService::new(db.clone(), bc);
         let request = CreateItemRequest {
             name: "Success Item".to_string(),
@@ -798,28 +464,42 @@ mod service_tests {
         assert!(result.is_ok());
 
         let item = result.unwrap();
-        assert_eq!(item.blockchain_status, BlockchainStatus::Submitted);
-        assert!(item.blockchain_signature.is_some());
+        assert_eq!(item.blockchain_status, BlockchainStatus::PendingSubmission);
+        assert!(item.blockchain_signature.is_none());
     }
 
     #[tokio::test]
     async fn test_health_check_both_healthy() {
-        let db = Arc::new(ScenarioDatabaseClient {
-            items: Mutex::new(vec![]),
-            retry_count_to_return: 0,
-            get_item_response: None,
-        });
-
-        let bc = Arc::new(ScenarioBlockchainClient {
-            should_fail: false,
-            error_to_return: None,
-        });
-
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::new());
         let service = AppService::new(db, bc);
         let health = service.health_check().await;
 
         assert_eq!(health.status, HealthStatus::Healthy);
         assert_eq!(health.database, HealthStatus::Healthy);
         assert_eq!(health.blockchain, HealthStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn test_process_pending_submissions_failure_updates_retry() {
+        let db = Arc::new(MockDatabaseClient::new());
+        let bc = Arc::new(MockBlockchainClient::failing("rpc error"));
+        let service = AppService::new(db.clone(), bc);
+
+        let request = CreateItemRequest::new("Retry Item".to_string(), "Content".to_string());
+        let created = service.create_and_submit_item(&request).await.unwrap();
+
+        let count = service.process_pending_submissions(10).await.unwrap();
+        assert_eq!(count, 1);
+
+        let updated = db.get_item(&created.id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.blockchain_status,
+            BlockchainStatus::PendingSubmission
+        );
+        assert!(updated.blockchain_last_error.is_some());
+        assert!(updated.blockchain_next_retry_at.is_some());
+        assert_eq!(updated.blockchain_retry_count, 1);
+        assert!(updated.blockchain_next_retry_at.unwrap() > Utc::now());
     }
 }

@@ -42,7 +42,7 @@ async fn test_create_item_success() {
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
     let item: Item = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(item.name, "Test Item");
-    assert_eq!(item.blockchain_status, BlockchainStatus::Submitted);
+    assert_eq!(item.blockchain_status, BlockchainStatus::PendingSubmission);
 }
 
 #[tokio::test]
@@ -208,9 +208,9 @@ async fn test_graceful_degradation_blockchain_failure() {
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
     let item: Item = serde_json::from_slice(&body_bytes).unwrap();
 
-    // Item should be created but with pending_submission status
+    // Item should be created and queued for submission
     assert_eq!(item.blockchain_status, BlockchainStatus::PendingSubmission);
-    assert!(item.blockchain_last_error.is_some());
+    assert!(item.blockchain_last_error.is_none());
 }
 
 #[tokio::test]
@@ -360,13 +360,22 @@ async fn test_retry_handler_not_eligible() {
         Arc::clone(&blockchain) as _,
     ));
 
-    // Create an item with Submitted status (not eligible for retry)
+    // Create an item and force it to Submitted status (not eligible for retry)
     let payload = CreateItemRequest::new("Test Item".to_string(), "Content".to_string());
     let created_item = state
         .service
         .create_and_submit_item(&payload)
         .await
         .unwrap();
+    db.update_blockchain_status(
+        &created_item.id,
+        BlockchainStatus::Submitted,
+        Some("sig"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     let router = create_router(state);
 

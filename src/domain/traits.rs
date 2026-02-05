@@ -3,7 +3,10 @@
 use async_trait::async_trait;
 
 use super::error::AppError;
-use super::types::{BlockchainStatus, CreateItemRequest, Item, PaginatedResponse};
+use super::types::{
+    BlockchainStatus, CreateItemRequest, Item, OutboxStatus, PaginatedResponse, SolanaOutboxEntry,
+    SolanaOutboxPayload,
+};
 use chrono::{DateTime, Utc};
 
 /// Database client trait for persistence operations
@@ -50,6 +53,39 @@ pub trait DatabaseClient: Send + Sync {
         error: Option<&str>,
         next_retry_at: Option<DateTime<Utc>>,
     ) -> Result<(), AppError>;
+
+    /// Claim pending Solana outbox entries for processing
+    async fn claim_pending_solana_outbox(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<SolanaOutboxEntry>, AppError>;
+
+    /// Mark a Solana outbox entry as completed and update item status
+    async fn complete_solana_outbox(
+        &self,
+        outbox_id: &str,
+        item_id: &str,
+        signature: &str,
+    ) -> Result<(), AppError>;
+
+    /// Mark a Solana outbox entry as failed and update item status
+    async fn fail_solana_outbox(
+        &self,
+        outbox_id: &str,
+        item_id: &str,
+        retry_count: i32,
+        outbox_status: OutboxStatus,
+        item_status: BlockchainStatus,
+        error: &str,
+        next_retry_at: Option<DateTime<Utc>>,
+    ) -> Result<(), AppError>;
+
+    /// Enqueue a new Solana outbox entry for an existing item
+    async fn enqueue_solana_outbox_for_item(
+        &self,
+        item_id: &str,
+        payload: &SolanaOutboxPayload,
+    ) -> Result<Item, AppError>;
 
     /// Get items pending blockchain submission
     async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, AppError>;
@@ -140,6 +176,43 @@ mod tests {
             _next_retry_at: Option<DateTime<Utc>>,
         ) -> Result<(), AppError> {
             Ok(())
+        }
+
+        async fn claim_pending_solana_outbox(
+            &self,
+            _limit: i64,
+        ) -> Result<Vec<SolanaOutboxEntry>, AppError> {
+            Ok(vec![])
+        }
+
+        async fn complete_solana_outbox(
+            &self,
+            _outbox_id: &str,
+            _item_id: &str,
+            _signature: &str,
+        ) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn fail_solana_outbox(
+            &self,
+            _outbox_id: &str,
+            _item_id: &str,
+            _retry_count: i32,
+            _outbox_status: OutboxStatus,
+            _item_status: BlockchainStatus,
+            _error: &str,
+            _next_retry_at: Option<DateTime<Utc>>,
+        ) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn enqueue_solana_outbox_for_item(
+            &self,
+            _item_id: &str,
+            _payload: &SolanaOutboxPayload,
+        ) -> Result<Item, AppError> {
+            Ok(Item::default())
         }
 
         async fn get_pending_blockchain_items(&self, _limit: i64) -> Result<Vec<Item>, AppError> {
