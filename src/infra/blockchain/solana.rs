@@ -11,6 +11,14 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
+#[cfg(feature = "real-blockchain")]
+use solana_sdk::{
+    hash::Hash, instruction::Instruction, message::Message, pubkey::Pubkey, signature::Signature,
+    transaction::Transaction,
+};
+#[cfg(feature = "real-blockchain")]
+use std::str::FromStr;
+
 use crate::domain::{BlockchainClient, BlockchainError};
 
 /// Configuration for the RPC client
@@ -256,74 +264,42 @@ impl RpcBlockchainClient {
             .unwrap_or_else(|| BlockchainError::SubmissionFailed("Unknown error".to_string())))
     }
 
-    /// Build and serialize a memo transaction
+    /// Build and serialize a memo transaction using solana-sdk for protocol-compliant
+    /// construction. Supports memos of any length (no 127-byte truncation).
     #[cfg(feature = "real-blockchain")]
     fn build_memo_transaction(
         &self,
         memo: &str,
         recent_blockhash: &str,
     ) -> Result<String, BlockchainError> {
-        // Memo program ID
-        let memo_program_id = bs58::decode("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
-            .into_vec()
+        const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+
+        let memo_program_id = Pubkey::from_str(MEMO_PROGRAM_ID)
+            .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
+        let blockhash = Hash::from_str(recent_blockhash)
+            .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
+        let payer_pubkey = Pubkey::from_str(&self.provider.public_key())
             .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
 
-        let recent_blockhash_bytes = bs58::decode(recent_blockhash)
+        let instruction = Instruction::new_with_bytes(memo_program_id, memo.as_bytes(), vec![]);
+
+        let message = Message::new_with_blockhash(&[instruction], Some(&payer_pubkey), &blockhash);
+
+        let mut tx = Transaction::new_unsigned(message);
+        let message_data = tx.message_data();
+        let signature_str = self.provider.sign(&message_data);
+        let signature_bytes = bs58::decode(&signature_str)
             .into_vec()
             .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
+        let signature = Signature::try_from(signature_bytes.as_slice())
+            .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
 
-        let public_key_bytes: Vec<u8> =
-            bs58::decode(self.provider.public_key()).into_vec().unwrap(); // Should always be valid base58 from provider
+        tx.replace_signatures(&[(payer_pubkey, signature)])
+            .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
 
-        // Build a simplified transaction structure
-        // This is a minimal memo transaction
-        let mut tx_data = vec![
-            1u8, // sig count
-            2u8, // num accounts
-        ];
-
-        // Number of signatures
-        tx_data.push(1u8);
-
-        // Message header
-        tx_data.push(1u8); // num_required_signatures
-        tx_data.push(0u8); // num_readonly_signed_accounts
-        tx_data.push(1u8); // num_readonly_unsigned_accounts
-
-        // Account keys (payer + memo program)
-        tx_data.push(2u8); // num accounts
-        tx_data.extend_from_slice(&public_key_bytes);
-        tx_data.extend_from_slice(&memo_program_id);
-
-        // Recent blockhash
-        tx_data.extend_from_slice(&recent_blockhash_bytes);
-
-        // Instructions
-        tx_data.push(1u8); // num instructions
-
-        // Memo instruction
-        tx_data.push(1u8); // program_id_index (memo program)
-        tx_data.push(1u8); // num accounts
-        tx_data.push(0u8); // account index (payer)
-
-        // Memo data
-        let memo_bytes = memo.as_bytes();
-        tx_data.push(memo_bytes.len() as u8);
-        tx_data.extend_from_slice(memo_bytes);
-
-        // Sign the message (everything after signatures)
-        let _message_start = 1 + 64; // 1 byte for sig count, 64 bytes for signature placeholder
-        let message = &tx_data[1..]; // Skip signature count
-
-        let signature_str = self.provider.sign(message);
-        let signature_bytes = bs58::decode(signature_str).into_vec().unwrap();
-
-        // Insert signature
-        let mut final_tx = vec![1u8]; // signature count
-        final_tx.extend_from_slice(&signature_bytes);
-        final_tx.extend_from_slice(message);
-
-        Ok(bs58::encode(&final_tx).into_string())
+        let serialized = bincode::serialize(&tx)
+            .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
+        Ok(bs58::encode(&serialized).into_string())
     }
 }
 
@@ -1379,6 +1355,24 @@ mod tests {
             // Invalid base58 blockhash
             let result = client.build_memo_transaction("test_memo", "invalid!!!");
             assert!(matches!(result, Err(BlockchainError::SubmissionFailed(_))));
+        }
+
+        /// Verifies memos longer than 127 bytes are not truncated (no u8 length encoding).
+        #[test]
+        fn test_build_memo_transaction_long_memo() {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let client =
+                RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
+                    .unwrap();
+
+            let blockhash = "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTy5nRhVT3";
+            let long_memo: String = (0..200).map(|i| ((i % 26) as u8 + b'a') as char).collect();
+            assert!(long_memo.len() > 127, "test memo must exceed 127 bytes");
+
+            let result = client.build_memo_transaction(&long_memo, blockhash);
+            assert!(result.is_ok(), "long memo must succeed without truncation");
+            let tx = result.unwrap();
+            assert!(bs58::decode(&tx).into_vec().is_ok());
         }
 
         #[tokio::test]
