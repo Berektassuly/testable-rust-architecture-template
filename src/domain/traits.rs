@@ -88,7 +88,9 @@ pub trait OutboxRepository: Send + Sync {
         signature: &str,
     ) -> Result<(), ItemError>;
 
-    /// Mark a Solana outbox entry as failed and update item status
+    /// Mark a Solana outbox entry as failed and update item status.
+    /// When provided, `attempt_blockhash` updates the sticky blockhash:
+    /// `Some(None)` clears it (e.g. after blockhash expired), `Some(Some(h))` persists it.
     async fn fail_solana_outbox(
         &self,
         outbox_id: &str,
@@ -98,6 +100,14 @@ pub trait OutboxRepository: Send + Sync {
         item_status: BlockchainStatus,
         error: &str,
         next_retry_at: Option<DateTime<Utc>>,
+        attempt_blockhash: Option<Option<&str>>,
+    ) -> Result<(), ItemError>;
+
+    /// Persist or clear the attempt blockhash for an outbox entry (e.g. when scheduling retry).
+    async fn save_attempt_blockhash(
+        &self,
+        outbox_id: &str,
+        blockhash: Option<&str>,
     ) -> Result<(), ItemError>;
 }
 
@@ -107,8 +117,14 @@ pub trait BlockchainClient: Send + Sync {
     /// Check blockchain RPC connectivity
     async fn health_check(&self) -> Result<(), HealthCheckError>;
 
-    /// Submit a transaction with the given hash/memo
-    async fn submit_transaction(&self, hash: &str) -> Result<String, BlockchainError>;
+    /// Submit a transaction with the given hash/memo.
+    /// Uses `existing_blockhash` when provided (retries); otherwise fetches latest.
+    /// Returns (signature, blockhash_used) on success.
+    async fn submit_transaction(
+        &self,
+        hash: &str,
+        existing_blockhash: Option<&str>,
+    ) -> Result<(String, String), BlockchainError>;
 
     /// Get transaction confirmation status
     async fn get_transaction_status(&self, signature: &str) -> Result<bool, BlockchainError> {
@@ -235,6 +251,15 @@ mod tests {
             _item_status: BlockchainStatus,
             _error: &str,
             _next_retry_at: Option<DateTime<Utc>>,
+            _attempt_blockhash: Option<Option<&str>>,
+        ) -> Result<(), ItemError> {
+            Ok(())
+        }
+
+        async fn save_attempt_blockhash(
+            &self,
+            _outbox_id: &str,
+            _blockhash: Option<&str>,
         ) -> Result<(), ItemError> {
             Ok(())
         }
@@ -248,8 +273,12 @@ mod tests {
             Ok(())
         }
 
-        async fn submit_transaction(&self, _hash: &str) -> Result<String, BlockchainError> {
-            Ok("sig_123".to_string())
+        async fn submit_transaction(
+            &self,
+            _hash: &str,
+            _existing_blockhash: Option<&str>,
+        ) -> Result<(String, String), BlockchainError> {
+            Ok(("sig_123".to_string(), "blockhash_123".to_string()))
         }
     }
 

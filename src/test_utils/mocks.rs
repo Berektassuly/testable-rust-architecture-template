@@ -145,6 +145,7 @@ impl ItemRepository for MockProvider {
             payload: build_solana_outbox_payload_from_request(&id, data),
             status: OutboxStatus::Pending,
             retry_count: 0,
+            attempt_blockhash: None,
             created_at: now,
         };
         let mut storage = self.storage.lock().unwrap();
@@ -229,6 +230,7 @@ impl ItemRepository for MockProvider {
             payload: payload.clone(),
             status: OutboxStatus::Pending,
             retry_count: 0,
+            attempt_blockhash: None,
             created_at: now,
         };
         let mut outbox = self.outbox.lock().unwrap();
@@ -350,6 +352,7 @@ impl OutboxRepository for MockProvider {
         item_status: BlockchainStatus,
         error: &str,
         next_retry_at: Option<DateTime<Utc>>,
+        attempt_blockhash: Option<Option<&str>>,
     ) -> Result<(), ItemError> {
         self.check_should_fail()?;
         let mut storage = self.storage.lock().unwrap();
@@ -366,6 +369,22 @@ impl OutboxRepository for MockProvider {
         if let Some(entry) = outbox.get_mut(outbox_id) {
             entry.status = outbox_status;
             entry.retry_count = retry_count;
+            if let Some(bh) = attempt_blockhash {
+                entry.attempt_blockhash = bh.map(std::string::ToString::to_string);
+            }
+        }
+        Ok(())
+    }
+
+    async fn save_attempt_blockhash(
+        &self,
+        outbox_id: &str,
+        blockhash: Option<&str>,
+    ) -> Result<(), ItemError> {
+        self.check_should_fail()?;
+        let mut outbox = self.outbox.lock().unwrap();
+        if let Some(entry) = outbox.get_mut(outbox_id) {
+            entry.attempt_blockhash = blockhash.map(std::string::ToString::to_string);
         }
         Ok(())
     }
@@ -435,12 +454,19 @@ impl BlockchainClient for MockBlockchainClient {
             .map_err(|_| HealthCheckError::BlockchainUnavailable)
     }
 
-    async fn submit_transaction(&self, hash: &str) -> Result<String, BlockchainError> {
+    async fn submit_transaction(
+        &self,
+        hash: &str,
+        existing_blockhash: Option<&str>,
+    ) -> Result<(String, String), BlockchainError> {
         self.check_should_fail()?;
         let signature = format!("sig_{}", hash);
+        let blockhash_used = existing_blockhash
+            .map(std::string::ToString::to_string)
+            .unwrap_or_else(|| "mock_blockhash".to_string());
         let mut transactions = self.transactions.lock().unwrap();
         transactions.push(hash.to_string());
-        Ok(signature)
+        Ok((signature, blockhash_used))
     }
 
     async fn get_transaction_status(&self, signature: &str) -> Result<bool, BlockchainError> {

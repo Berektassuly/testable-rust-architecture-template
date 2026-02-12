@@ -133,6 +133,7 @@ impl PostgresClient {
             .try_get("payload")
             .map_err(|_| ItemError::RepositoryFailure)?;
         let status_str: String = row.get("status");
+        let attempt_blockhash: Option<String> = row.get("attempt_blockhash");
 
         Ok(SolanaOutboxEntry {
             id: row.get::<uuid::Uuid, _>("id").to_string(),
@@ -140,6 +141,7 @@ impl PostgresClient {
             payload: payload.0,
             status: status_str.parse().unwrap_or(OutboxStatus::Pending),
             retry_count: row.get("retry_count"),
+            attempt_blockhash,
             created_at: row.get("created_at"),
         })
     }
@@ -515,7 +517,7 @@ impl OutboxRepository for PostgresClient {
             SET status = 'processing'
             FROM candidate
             WHERE o.id = candidate.id
-            RETURNING o.id, o.aggregate_id, o.payload, o.status, o.retry_count, o.created_at
+            RETURNING o.id, o.aggregate_id, o.payload, o.status, o.retry_count, o.attempt_blockhash, o.created_at
             "#,
         )
         .bind(now)
@@ -584,26 +586,53 @@ impl OutboxRepository for PostgresClient {
         item_status: BlockchainStatus,
         error: &str,
         next_retry_at: Option<DateTime<Utc>>,
+        attempt_blockhash: Option<Option<&str>>,
     ) -> Result<(), ItemError> {
         let now = Utc::now();
         let mut tx = self.pool.begin().await.map_err(map_sqlx_to_item_error)?;
 
-        sqlx::query(
-            r#"
-            UPDATE solana_outbox
-            SET status = $1,
-                retry_count = $2,
-                next_retry_at = $3
-            WHERE id = $4
-            "#,
-        )
-        .bind(outbox_status.as_str())
-        .bind(retry_count)
-        .bind(next_retry_at)
-        .bind(outbox_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sqlx_to_item_error)?;
+        // Update outbox: status, retry_count, next_retry_at, and optionally attempt_blockhash
+        let set_blockhash = attempt_blockhash.is_some();
+        let blockhash_bind: Option<String> =
+            attempt_blockhash.and_then(|o| o.map(std::string::ToString::to_string));
+
+        if set_blockhash {
+            sqlx::query(
+                r#"
+                UPDATE solana_outbox
+                SET status = $1,
+                    retry_count = $2,
+                    next_retry_at = $3,
+                    attempt_blockhash = $4
+                WHERE id = $5
+                "#,
+            )
+            .bind(outbox_status.as_str())
+            .bind(retry_count)
+            .bind(next_retry_at)
+            .bind(blockhash_bind)
+            .bind(outbox_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_to_item_error)?;
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE solana_outbox
+                SET status = $1,
+                    retry_count = $2,
+                    next_retry_at = $3
+                WHERE id = $4
+                "#,
+            )
+            .bind(outbox_status.as_str())
+            .bind(retry_count)
+            .bind(next_retry_at)
+            .bind(outbox_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_to_item_error)?;
+        }
 
         sqlx::query(
             r#"
@@ -628,6 +657,27 @@ impl OutboxRepository for PostgresClient {
 
         tx.commit().await.map_err(map_sqlx_to_item_error)?;
 
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn save_attempt_blockhash(
+        &self,
+        outbox_id: &str,
+        blockhash: Option<&str>,
+    ) -> Result<(), ItemError> {
+        sqlx::query(
+            r#"
+            UPDATE solana_outbox
+            SET attempt_blockhash = $1
+            WHERE id = $2
+            "#,
+        )
+        .bind(blockhash)
+        .bind(outbox_id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_to_item_error)?;
         Ok(())
     }
 }

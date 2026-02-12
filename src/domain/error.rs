@@ -19,6 +19,14 @@ pub enum ItemError {
 pub enum BlockchainError {
     #[error("Transaction submission failed: {0}")]
     SubmissionFailed(String),
+    /// Submission failed but the blockhash used is provided for sticky retry
+    #[error("Transaction submission failed: {message} (blockhash_used: {blockhash_used})")]
+    SubmissionFailedWithBlockhash {
+        message: String,
+        blockhash_used: String,
+    },
+    #[error("Blockhash expired or invalid")]
+    BlockhashExpired,
     #[error("Network error: {0}")]
     NetworkError(String),
     #[error("Insufficient funds for transaction")]

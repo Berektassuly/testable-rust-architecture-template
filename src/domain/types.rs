@@ -123,6 +123,8 @@ pub struct SolanaOutboxEntry {
     pub status: OutboxStatus,
     /// Retry attempts
     pub retry_count: i32,
+    /// Blockhash used for this attempt; reused on retries until expired (sticky blockhash)
+    pub attempt_blockhash: Option<String>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
 }

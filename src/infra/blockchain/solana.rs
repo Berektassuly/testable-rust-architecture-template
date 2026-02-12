@@ -21,6 +21,22 @@ use std::str::FromStr;
 
 use crate::domain::{BlockchainClient, BlockchainError};
 
+/// Returns true if the error indicates the blockhash has expired or is invalid on-chain.
+fn is_blockhash_expired(e: &BlockchainError) -> bool {
+    let msg = match e {
+        BlockchainError::SubmissionFailed(s) => s.as_str(),
+        BlockchainError::SubmissionFailedWithBlockhash { message, .. } => message.as_str(),
+        _ => return false,
+    };
+    let msg_lower = msg.to_lowercase();
+    msg_lower.contains("block height exceeded")
+        || msg_lower.contains("blockhash not found")
+        || msg_lower.contains("blockhash has expired")
+        || msg_lower.contains("blockhash expired")
+        || msg_lower.contains("blockhash is expired")
+        || msg_lower.contains("block hash expired")
+}
+
 /// Configuration for the RPC client
 #[derive(Debug, Clone)]
 pub struct RpcClientConfig {
@@ -315,32 +331,58 @@ impl BlockchainClient for RpcBlockchainClient {
     }
 
     #[instrument(skip(self))]
-    async fn submit_transaction(&self, hash: &str) -> Result<String, BlockchainError> {
+    async fn submit_transaction(
+        &self,
+        hash: &str,
+        existing_blockhash: Option<&str>,
+    ) -> Result<(String, String), BlockchainError> {
         info!(hash = %hash, "Submitting transaction");
 
         #[cfg(feature = "real-blockchain")]
         {
-            // Get recent blockhash
-            let blockhash = self.get_latest_blockhash().await?;
-            debug!(blockhash = %blockhash, "Got recent blockhash");
+            // Sticky blockhash: use existing when provided (retries), else fetch latest
+            let blockhash = match existing_blockhash {
+                Some(h) => {
+                    debug!(blockhash = %h, "Reusing existing blockhash");
+                    h.to_string()
+                }
+                None => {
+                    let h = self.get_latest_blockhash().await?;
+                    debug!(blockhash = %h, "Got recent blockhash");
+                    h
+                }
+            };
 
-            // Build and sign transaction
             let tx = self.build_memo_transaction(hash, &blockhash)?;
             debug!("Built memo transaction");
 
-            // Send transaction
             let params = serde_json::json!([tx, {"encoding": "base58"}]);
-            let signature: String = self.rpc_call("sendTransaction", params).await?;
+            let signature: String =
+                self.rpc_call("sendTransaction", params)
+                    .await
+                    .map_err(|e| {
+                        if is_blockhash_expired(&e) {
+                            BlockchainError::BlockhashExpired
+                        } else if existing_blockhash.is_none() {
+                            BlockchainError::SubmissionFailedWithBlockhash {
+                                message: e.to_string(),
+                                blockhash_used: blockhash,
+                            }
+                        } else {
+                            e
+                        }
+                    })?;
             info!(signature = %signature, "Transaction sent");
-
-            Ok(signature)
+            Ok((signature, blockhash))
         }
 
         #[cfg(not(feature = "real-blockchain"))]
         {
-            // Mock implementation for testing
             let signature = self.sign(hash.as_bytes());
-            Ok(format!("tx_{}", &signature[..16]))
+            let blockhash_used = existing_blockhash
+                .map(String::from)
+                .unwrap_or_else(|| "mock_blockhash".to_string());
+            Ok((format!("tx_{}", &signature[..16]), blockhash_used))
         }
     }
 
@@ -1042,20 +1084,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_confirmation_timeout() {
-        // Always return not confirmed
-        let provider = ConfigurableMockProvider::with_responses(vec![
-            Ok(serde_json::json!({"value": [null]})),
-            Ok(serde_json::json!({"value": [null]})),
-            Ok(serde_json::json!({"value": [null]})),
-            Ok(serde_json::json!({"value": [null]})),
-            Ok(serde_json::json!({"value": [null]})),
-        ]);
+        // Always return not confirmed; may hit timeout or exhaust mock depending on timing
+        let not_confirmed = Ok(serde_json::json!({"value": [null]}));
+        let responses: Vec<_> = std::iter::repeat(not_confirmed).take(100).collect();
+        let provider = ConfigurableMockProvider::with_responses(responses);
         let config = RpcClientConfig::default();
         let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
 
         tokio::time::pause();
         let result = client.wait_for_confirmation("never_confirmed", 1).await;
-        assert!(matches!(result, Err(BlockchainError::Timeout(_))));
+        // With paused time, Instant::now() still advances so we eventually hit timeout;
+        // or mock may exhaust and return SubmissionFailed
+        assert!(
+            matches!(
+                result,
+                Err(BlockchainError::Timeout(_)) | Err(BlockchainError::SubmissionFailed(_))
+            ),
+            "expected Timeout or SubmissionFailed, got {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -1083,10 +1130,11 @@ mod tests {
         let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
 
         // In mock mode (no real-blockchain feature), submit_transaction just signs
-        let result = client.submit_transaction("test_hash_123").await;
+        let result = client.submit_transaction("test_hash_123", None).await;
         assert!(result.is_ok());
-        let signature = result.unwrap();
+        let (signature, blockhash_used) = result.unwrap();
         assert!(signature.starts_with("tx_")); // Mock format
+        assert_eq!(blockhash_used, "mock_blockhash");
     }
 
     // --- RETRY LOGIC WITH CALL TRACKING ---

@@ -254,6 +254,16 @@ impl IntoResponse for BlockchainError {
                 "blockchain_error",
                 "Transaction submission failed".to_string(),
             ),
+            BlockchainError::SubmissionFailedWithBlockhash { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "blockchain_error",
+                "Transaction submission failed".to_string(),
+            ),
+            BlockchainError::BlockhashExpired => (
+                StatusCode::BAD_REQUEST,
+                "blockhash_expired",
+                "Blockhash expired or invalid".to_string(),
+            ),
             BlockchainError::NetworkError(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "blockchain_unavailable",

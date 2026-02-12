@@ -6,9 +6,9 @@ use tracing::{error, info, instrument, warn};
 use validator::Validate;
 
 use crate::domain::{
-    BlockchainClient, BlockchainStatus, CreateItemRequest, HealthResponse, HealthStatus, Item,
-    ItemError, ItemRepository, OutboxRepository, OutboxStatus, PaginatedResponse,
-    SolanaOutboxEntry, ValidationError, build_solana_outbox_payload_from_item,
+    BlockchainClient, BlockchainError, BlockchainStatus, CreateItemRequest, HealthResponse,
+    HealthStatus, Item, ItemError, ItemRepository, OutboxRepository, OutboxStatus,
+    PaginatedResponse, SolanaOutboxEntry, ValidationError, build_solana_outbox_payload_from_item,
 };
 
 /// Error type for create-item flow (validation or repository).
@@ -170,12 +170,17 @@ impl AppService {
         Ok(count)
     }
 
-    /// Process a single pending submission
+    /// Process a single pending submission (sticky blockhash for idempotent retries).
     async fn process_outbox_entry(&self, entry: &SolanaOutboxEntry) -> Result<(), ProcessError> {
         let hash = &entry.payload.hash;
+        let existing_blockhash = entry.attempt_blockhash.as_deref();
 
-        match self.blockchain_client.submit_transaction(&hash).await {
-            Ok(signature) => {
+        match self
+            .blockchain_client
+            .submit_transaction(hash, existing_blockhash)
+            .await
+        {
+            Ok((signature, _blockhash_used)) => {
                 info!(
                     outbox_id = %entry.id,
                     item_id = %entry.aggregate_id,
@@ -206,6 +211,17 @@ impl AppService {
                     )
                 };
 
+                // Sticky blockhash: persist or clear for next retry
+                let attempt_blockhash = match &e {
+                    BlockchainError::BlockhashExpired => Some(None),
+                    BlockchainError::SubmissionFailedWithBlockhash { blockhash_used, .. }
+                        if entry.attempt_blockhash.is_none() =>
+                    {
+                        Some(Some(blockhash_used.as_str()))
+                    }
+                    _ => None,
+                };
+
                 self.outbox_repo
                     .fail_solana_outbox(
                         &entry.id,
@@ -215,6 +231,7 @@ impl AppService {
                         item_status,
                         &e.to_string(),
                         next_retry,
+                        attempt_blockhash,
                     )
                     .await?;
             }
