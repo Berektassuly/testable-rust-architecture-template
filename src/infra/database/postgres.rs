@@ -220,8 +220,8 @@ impl ItemRepository for PostgresClient {
 
         sqlx::query(
             r#"
-            INSERT INTO solana_outbox (id, aggregate_id, payload, status, created_at, retry_count)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO solana_outbox (id, aggregate_id, payload, status, created_at, retry_count, next_retry_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             "#,
         )
         .bind(outbox_id)
@@ -230,6 +230,7 @@ impl ItemRepository for PostgresClient {
         .bind(OutboxStatus::Pending.as_str())
         .bind(now)
         .bind(0i32)
+        .bind(Option::<DateTime<Utc>>::None)
         .execute(&mut *tx)
         .await
         .map_err(map_sqlx_to_item_error)?;
@@ -386,8 +387,8 @@ impl ItemRepository for PostgresClient {
 
         sqlx::query(
             r#"
-            INSERT INTO solana_outbox (id, aggregate_id, payload, status, created_at, retry_count)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO solana_outbox (id, aggregate_id, payload, status, created_at, retry_count, next_retry_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             "#,
         )
         .bind(outbox_id)
@@ -396,6 +397,7 @@ impl ItemRepository for PostgresClient {
         .bind(OutboxStatus::Pending.as_str())
         .bind(now)
         .bind(0i32)
+        .bind(Option::<DateTime<Utc>>::None)
         .execute(&mut *tx)
         .await
         .map_err(map_sqlx_to_item_error)?;
@@ -501,12 +503,11 @@ impl OutboxRepository for PostgresClient {
         let rows = sqlx::query(
             r#"
             WITH candidate AS (
-                SELECT o.id
-                FROM solana_outbox o
-                JOIN items i ON i.id = o.aggregate_id
-                WHERE o.status = 'pending'
-                  AND (i.blockchain_next_retry_at IS NULL OR i.blockchain_next_retry_at <= $1)
-                ORDER BY o.created_at ASC
+                SELECT id
+                FROM solana_outbox
+                WHERE status = 'pending'
+                  AND (next_retry_at IS NULL OR next_retry_at <= $1)
+                ORDER BY created_at ASC
                 LIMIT $2
                 FOR UPDATE SKIP LOCKED
             )
@@ -591,12 +592,14 @@ impl OutboxRepository for PostgresClient {
             r#"
             UPDATE solana_outbox
             SET status = $1,
-                retry_count = $2
-            WHERE id = $3
+                retry_count = $2,
+                next_retry_at = $3
+            WHERE id = $4
             "#,
         )
         .bind(outbox_status.as_str())
         .bind(retry_count)
+        .bind(next_retry_at)
         .bind(outbox_id)
         .execute(&mut *tx)
         .await
