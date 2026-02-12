@@ -6,10 +6,48 @@ use tracing::{error, info, instrument, warn};
 use validator::Validate;
 
 use crate::domain::{
-    AppError, BlockchainClient, BlockchainStatus, CreateItemRequest, DatabaseClient,
-    HealthResponse, HealthStatus, Item, OutboxStatus, PaginatedResponse, SolanaOutboxEntry,
+    BlockchainClient, BlockchainStatus, CreateItemRequest, DatabaseClient, HealthResponse,
+    HealthStatus, Item, ItemError, OutboxStatus, PaginatedResponse, SolanaOutboxEntry,
     ValidationError, build_solana_outbox_payload_from_item,
 };
+
+/// Error type for create-item flow (validation or repository).
+#[derive(Debug)]
+pub enum CreateItemError {
+    Validation(ValidationError),
+    Item(ItemError),
+}
+
+impl From<ValidationError> for CreateItemError {
+    fn from(e: ValidationError) -> Self {
+        CreateItemError::Validation(e)
+    }
+}
+
+impl From<ItemError> for CreateItemError {
+    fn from(e: ItemError) -> Self {
+        CreateItemError::Item(e)
+    }
+}
+
+/// Error type for outbox processing (repository or blockchain).
+#[derive(Debug)]
+pub enum ProcessError {
+    Item(ItemError),
+    Blockchain(crate::domain::BlockchainError),
+}
+
+impl From<ItemError> for ProcessError {
+    fn from(e: ItemError) -> Self {
+        ProcessError::Item(e)
+    }
+}
+
+impl From<crate::domain::BlockchainError> for ProcessError {
+    fn from(e: crate::domain::BlockchainError) -> Self {
+        ProcessError::Blockchain(e)
+    }
+}
 
 /// Maximum number of retry attempts for blockchain submission
 const MAX_RETRY_ATTEMPTS: i32 = 10;
@@ -40,10 +78,10 @@ impl AppService {
     pub async fn create_and_submit_item(
         &self,
         request: &CreateItemRequest,
-    ) -> Result<Item, AppError> {
+    ) -> Result<Item, CreateItemError> {
         request.validate().map_err(|e| {
             warn!(error = %e, "Validation failed");
-            AppError::Validation(ValidationError::Multiple(e.to_string()))
+            CreateItemError::Validation(ValidationError::from(e))
         })?;
 
         info!("Creating new item: {}", request.name);
@@ -55,7 +93,7 @@ impl AppService {
 
     /// Get an item by ID
     #[instrument(skip(self))]
-    pub async fn get_item(&self, id: &str) -> Result<Option<Item>, AppError> {
+    pub async fn get_item(&self, id: &str) -> Result<Option<Item>, ItemError> {
         self.db_client.get_item(id).await
     }
 
@@ -65,24 +103,25 @@ impl AppService {
         &self,
         limit: i64,
         cursor: Option<&str>,
-    ) -> Result<PaginatedResponse<Item>, AppError> {
+    ) -> Result<PaginatedResponse<Item>, ItemError> {
         self.db_client.list_items(limit, cursor).await
     }
 
     /// Retry blockchain submission for a specific item
     #[instrument(skip(self))]
-    pub async fn retry_blockchain_submission(&self, id: &str) -> Result<Item, AppError> {
-        let item = self.db_client.get_item(id).await?.ok_or_else(|| {
-            AppError::Database(crate::domain::DatabaseError::NotFound(id.to_string()))
-        })?;
+    pub async fn retry_blockchain_submission(&self, id: &str) -> Result<Item, ItemError> {
+        let item = self
+            .db_client
+            .get_item(id)
+            .await?
+            .ok_or_else(|| ItemError::NotFound(id.to_string()))?;
 
         if item.blockchain_status != BlockchainStatus::PendingSubmission
             && item.blockchain_status != BlockchainStatus::Failed
         {
-            return Err(AppError::Validation(ValidationError::InvalidField {
-                field: "blockchain_status".to_string(),
-                message: "Item is not pending submission or failed".to_string(),
-            }));
+            return Err(ItemError::InvalidState(
+                "Item is not pending submission or failed".to_string(),
+            ));
         }
 
         if item.blockchain_status == BlockchainStatus::PendingSubmission {
@@ -101,7 +140,7 @@ impl AppService {
 
     /// Process pending blockchain submissions (called by background worker)
     #[instrument(skip(self))]
-    pub async fn process_pending_submissions(&self, batch_size: i64) -> Result<usize, AppError> {
+    pub async fn process_pending_submissions(&self, batch_size: i64) -> Result<usize, ItemError> {
         let pending_entries = self
             .db_client
             .claim_pending_solana_outbox(batch_size)
@@ -129,7 +168,7 @@ impl AppService {
     }
 
     /// Process a single pending submission
-    async fn process_outbox_entry(&self, entry: &SolanaOutboxEntry) -> Result<(), AppError> {
+    async fn process_outbox_entry(&self, entry: &SolanaOutboxEntry) -> Result<(), ProcessError> {
         let hash = &entry.payload.hash;
 
         match self.blockchain_client.submit_transaction(&hash).await {
@@ -224,7 +263,7 @@ mod tests {
 #[cfg(test)]
 mod service_tests {
     use super::*;
-    use crate::domain::{BlockchainStatus, ValidationError};
+    use crate::domain::BlockchainStatus;
     use crate::test_utils::{MockBlockchainClient, MockDatabaseClient};
     use chrono::Utc;
     use std::sync::Arc;
@@ -247,7 +286,7 @@ mod service_tests {
         };
 
         let result = service.create_and_submit_item(&request).await;
-        assert!(matches!(result, Err(AppError::Validation(_))));
+        assert!(matches!(result, Err(CreateItemError::Validation(_))));
     }
 
     #[tokio::test]
@@ -296,10 +335,10 @@ mod service_tests {
         let result = service.retry_blockchain_submission(&created.id).await;
 
         match result {
-            Err(AppError::Validation(ValidationError::InvalidField { field, .. })) => {
-                assert_eq!(field, "blockchain_status");
+            Err(ItemError::InvalidState(msg)) => {
+                assert!(msg.contains("not pending submission"));
             }
-            _ => panic!("Expected validation error for invalid item status"),
+            _ => panic!("Expected invalid state error for invalid item status"),
         }
     }
 
@@ -378,12 +417,7 @@ mod service_tests {
 
         let result = service.retry_blockchain_submission("nonexistent").await;
 
-        assert!(matches!(
-            result,
-            Err(AppError::Database(crate::domain::DatabaseError::NotFound(
-                _
-            )))
-        ));
+        assert!(matches!(result, Err(ItemError::NotFound(_))));
     }
 
     #[tokio::test]

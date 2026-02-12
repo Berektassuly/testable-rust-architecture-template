@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
-use crate::domain::{AppError, BlockchainClient, BlockchainError};
+use crate::domain::{BlockchainClient, BlockchainError};
 
 /// Configuration for the RPC client
 #[derive(Debug, Clone)]
@@ -41,7 +41,7 @@ pub trait SolanaRpcProvider: Send + Sync {
         &self,
         method: &str,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, AppError>;
+    ) -> Result<serde_json::Value, BlockchainError>;
 
     /// Get the provider's public key
     fn public_key(&self) -> String;
@@ -62,11 +62,11 @@ impl HttpSolanaRpcProvider {
         rpc_url: &str,
         signing_key: SigningKey,
         timeout: Duration,
-    ) -> Result<Self, AppError> {
+    ) -> Result<Self, BlockchainError> {
         let http_client = Client::builder()
             .timeout(timeout)
             .build()
-            .map_err(|e| AppError::Blockchain(BlockchainError::Connection(e.to_string())))?;
+            .map_err(|e| BlockchainError::NetworkError(e.to_string()))?;
 
         Ok(Self {
             http_client,
@@ -82,7 +82,7 @@ impl SolanaRpcProvider for HttpSolanaRpcProvider {
         &self,
         method: &str,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, AppError> {
+    ) -> Result<serde_json::Value, BlockchainError> {
         let request = JsonRpcRequest {
             jsonrpc: "2.0",
             id: 1,
@@ -98,31 +98,31 @@ impl SolanaRpcProvider for HttpSolanaRpcProvider {
             .await
             .map_err(|e| {
                 if e.is_timeout() {
-                    AppError::Blockchain(BlockchainError::Timeout(e.to_string()))
+                    BlockchainError::Timeout(e.to_string())
                 } else {
-                    AppError::Blockchain(BlockchainError::RpcError(e.to_string()))
+                    BlockchainError::NetworkError(e.to_string())
                 }
             })?;
 
         let rpc_response: JsonRpcResponse<serde_json::Value> = response
             .json()
             .await
-            .map_err(|e| AppError::Blockchain(BlockchainError::RpcError(e.to_string())))?;
+            .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
 
         if let Some(error) = rpc_response.error {
             // Check for insufficient funds error
             if error.message.contains("insufficient") || error.code == -32002 {
-                return Err(AppError::Blockchain(BlockchainError::InsufficientFunds));
+                return Err(BlockchainError::InsufficientFunds);
             }
-            return Err(AppError::Blockchain(BlockchainError::RpcError(format!(
+            return Err(BlockchainError::SubmissionFailed(format!(
                 "{}: {}",
                 error.code, error.message
-            ))));
+            )));
         }
 
-        rpc_response.result.ok_or_else(|| {
-            AppError::Blockchain(BlockchainError::RpcError("Empty response".to_string()))
-        })
+        rpc_response
+            .result
+            .ok_or_else(|| BlockchainError::SubmissionFailed("Empty response".to_string()))
     }
 
     fn public_key(&self) -> String {
@@ -189,7 +189,7 @@ impl RpcBlockchainClient {
         rpc_url: &str,
         signing_key: SigningKey,
         config: RpcClientConfig,
-    ) -> Result<Self, AppError> {
+    ) -> Result<Self, BlockchainError> {
         let provider = HttpSolanaRpcProvider::new(rpc_url, signing_key, config.timeout)?;
         info!(rpc_url = %rpc_url, "Created blockchain client");
         Ok(Self {
@@ -199,7 +199,7 @@ impl RpcBlockchainClient {
     }
 
     /// Create a new RPC blockchain client with default configuration
-    pub fn with_defaults(rpc_url: &str, signing_key: SigningKey) -> Result<Self, AppError> {
+    pub fn with_defaults(rpc_url: &str, signing_key: SigningKey) -> Result<Self, BlockchainError> {
         Self::new(rpc_url, signing_key, RpcClientConfig::default())
     }
 
@@ -226,14 +226,10 @@ impl RpcBlockchainClient {
         &self,
         method: &str,
         params: P,
-    ) -> Result<R, AppError> {
+    ) -> Result<R, BlockchainError> {
         // Serialize parameters to JSON Value
-        let params_value = serde_json::to_value(params).map_err(|e| {
-            AppError::Blockchain(BlockchainError::RpcError(format!(
-                "Serialization error: {}",
-                e
-            )))
-        })?;
+        let params_value = serde_json::to_value(params)
+            .map_err(|e| BlockchainError::SubmissionFailed(format!("Serialization: {}", e)))?;
 
         let mut last_error = None;
         for attempt in 0..=self.config.max_retries {
@@ -246,12 +242,8 @@ impl RpcBlockchainClient {
                 .await
             {
                 Ok(result_value) => {
-                    // Deserialize result from JSON Value
                     return serde_json::from_value(result_value).map_err(|e| {
-                        AppError::Blockchain(BlockchainError::RpcError(format!(
-                            "Deserialization error: {}",
-                            e
-                        )))
+                        BlockchainError::SubmissionFailed(format!("Deserialization: {}", e))
                     });
                 }
                 Err(e) => {
@@ -260,9 +252,8 @@ impl RpcBlockchainClient {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| {
-            AppError::Blockchain(BlockchainError::RpcError("Unknown error".to_string()))
-        }))
+        Err(last_error
+            .unwrap_or_else(|| BlockchainError::SubmissionFailed("Unknown error".to_string())))
     }
 
     /// Build and serialize a memo transaction
@@ -271,15 +262,15 @@ impl RpcBlockchainClient {
         &self,
         memo: &str,
         recent_blockhash: &str,
-    ) -> Result<String, AppError> {
+    ) -> Result<String, BlockchainError> {
         // Memo program ID
         let memo_program_id = bs58::decode("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
             .into_vec()
-            .map_err(|e| AppError::Blockchain(BlockchainError::InvalidSignature(e.to_string())))?;
+            .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
 
         let recent_blockhash_bytes = bs58::decode(recent_blockhash)
             .into_vec()
-            .map_err(|e| AppError::Blockchain(BlockchainError::InvalidSignature(e.to_string())))?;
+            .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
 
         let public_key_bytes: Vec<u8> =
             bs58::decode(self.provider.public_key()).into_vec().unwrap(); // Should always be valid base58 from provider
@@ -339,13 +330,16 @@ impl RpcBlockchainClient {
 #[async_trait]
 impl BlockchainClient for RpcBlockchainClient {
     #[instrument(skip(self))]
-    async fn health_check(&self) -> Result<(), AppError> {
-        let _: u64 = self.rpc_call("getSlot", Vec::<()>::new()).await?;
+    async fn health_check(&self) -> Result<(), crate::domain::HealthCheckError> {
+        let _: u64 = self
+            .rpc_call("getSlot", Vec::<()>::new())
+            .await
+            .map_err(|_| crate::domain::HealthCheckError::BlockchainUnavailable)?;
         Ok(())
     }
 
     #[instrument(skip(self))]
-    async fn submit_transaction(&self, hash: &str) -> Result<String, AppError> {
+    async fn submit_transaction(&self, hash: &str) -> Result<String, BlockchainError> {
         info!(hash = %hash, "Submitting transaction");
 
         #[cfg(feature = "real-blockchain")]
@@ -375,12 +369,12 @@ impl BlockchainClient for RpcBlockchainClient {
     }
 
     #[instrument(skip(self))]
-    async fn get_block_height(&self) -> Result<u64, AppError> {
+    async fn get_block_height(&self) -> Result<u64, BlockchainError> {
         self.rpc_call("getBlockHeight", Vec::<()>::new()).await
     }
 
     #[instrument(skip(self))]
-    async fn get_latest_blockhash(&self) -> Result<String, AppError> {
+    async fn get_latest_blockhash(&self) -> Result<String, BlockchainError> {
         let result: BlockhashResult = self
             .rpc_call("getLatestBlockhash", Vec::<()>::new())
             .await?;
@@ -388,7 +382,7 @@ impl BlockchainClient for RpcBlockchainClient {
     }
 
     #[instrument(skip(self))]
-    async fn get_transaction_status(&self, signature: &str) -> Result<bool, AppError> {
+    async fn get_transaction_status(&self, signature: &str) -> Result<bool, BlockchainError> {
         let params = serde_json::json!([[signature], {"searchTransactionHistory": true}]);
         let result: SignatureStatusResult = self.rpc_call("getSignatureStatuses", params).await?;
 
@@ -396,9 +390,9 @@ impl BlockchainClient for RpcBlockchainClient {
             Some(Some(status)) => {
                 // Check if transaction errored
                 if status.err.is_some() {
-                    return Err(AppError::Blockchain(BlockchainError::TransactionFailed(
-                        format!("Transaction failed: {:?}", status.err),
-                    )));
+                    return Err(BlockchainError::SubmissionFailed(
+                        "Transaction failed".to_string(),
+                    ));
                 }
                 // Check confirmation status
                 let confirmed = status.confirmation_status.as_deref() == Some("confirmed")
@@ -414,7 +408,7 @@ impl BlockchainClient for RpcBlockchainClient {
         &self,
         signature: &str,
         timeout_secs: u64,
-    ) -> Result<bool, AppError> {
+    ) -> Result<bool, BlockchainError> {
         let timeout = Duration::from_secs(timeout_secs);
         let start = std::time::Instant::now();
         let poll_interval = Duration::from_millis(500);
@@ -428,10 +422,8 @@ impl BlockchainClient for RpcBlockchainClient {
                 Ok(false) => {
                     debug!(signature = %signature, "Transaction not yet confirmed");
                 }
-                Err(AppError::Blockchain(BlockchainError::TransactionFailed(msg))) => {
-                    return Err(AppError::Blockchain(BlockchainError::TransactionFailed(
-                        msg,
-                    )));
+                Err(BlockchainError::SubmissionFailed(msg)) => {
+                    return Err(BlockchainError::SubmissionFailed(msg));
                 }
                 Err(e) => {
                     warn!(signature = %signature, error = ?e, "Error checking transaction status");
@@ -440,37 +432,32 @@ impl BlockchainClient for RpcBlockchainClient {
             tokio::time::sleep(poll_interval).await;
         }
 
-        Err(AppError::Blockchain(BlockchainError::Timeout(format!(
+        Err(BlockchainError::Timeout(format!(
             "Transaction {} not confirmed within {}s",
             signature, timeout_secs
-        ))))
+        )))
     }
 }
 
 /// Parse a base58-encoded private key into a SigningKey
-pub fn signing_key_from_base58(secret: &SecretString) -> Result<SigningKey, AppError> {
+pub fn signing_key_from_base58(secret: &SecretString) -> Result<SigningKey, BlockchainError> {
     let key_bytes = bs58::decode(secret.expose_secret())
         .into_vec()
-        .map_err(|e| AppError::Blockchain(BlockchainError::InvalidSignature(e.to_string())))?;
+        .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
 
     // Handle both 32-byte (seed) and 64-byte (keypair) formats
     let key_array: [u8; 32] = if key_bytes.len() == 64 {
-        // Solana keypair format: first 32 bytes are the secret key
-        key_bytes[..32].try_into().map_err(|_| {
-            AppError::Blockchain(BlockchainError::InvalidSignature(
-                "Invalid keypair format".to_string(),
-            ))
-        })?
+        key_bytes[..32]
+            .try_into()
+            .map_err(|_| BlockchainError::SubmissionFailed("Invalid keypair format".to_string()))?
     } else if key_bytes.len() == 32 {
         key_bytes.try_into().map_err(|v: Vec<u8>| {
-            AppError::Blockchain(BlockchainError::InvalidSignature(format!(
-                "Key must be 32 bytes, got {}",
-                v.len()
-            )))
+            BlockchainError::SubmissionFailed(format!("Key must be 32 bytes, got {}", v.len()))
         })?
     } else {
-        return Err(AppError::Blockchain(BlockchainError::InvalidSignature(
-            format!("Key must be 32 or 64 bytes, got {}", key_bytes.len()),
+        return Err(BlockchainError::SubmissionFailed(format!(
+            "Key must be 32 or 64 bytes, got {}",
+            key_bytes.len()
         )));
     };
 
@@ -648,7 +635,7 @@ mod tests {
             &self,
             method: &str,
             _params: serde_json::Value,
-        ) -> Result<serde_json::Value, AppError> {
+        ) -> Result<serde_json::Value, BlockchainError> {
             let mut state = self.state.lock().unwrap();
             state.requests.push(method.to_string());
 
@@ -656,11 +643,11 @@ mod tests {
                 state.should_fail_count -= 1;
                 if let Some(ref err) = state.failure_error {
                     return match err {
-                        BlockchainErrorType::Timeout => Err(AppError::Blockchain(
-                            BlockchainError::Timeout("Mock timeout".to_string()),
-                        )),
-                        BlockchainErrorType::Rpc => Err(AppError::Blockchain(
-                            BlockchainError::RpcError("Mock RPC error".to_string()),
+                        BlockchainErrorType::Timeout => {
+                            Err(BlockchainError::Timeout("Mock timeout".to_string()))
+                        }
+                        BlockchainErrorType::Rpc => Err(BlockchainError::SubmissionFailed(
+                            "Mock RPC error".to_string(),
                         )),
                     };
                 }
@@ -721,7 +708,7 @@ mod tests {
         let result = client.health_check().await;
         assert!(matches!(
             result,
-            Err(AppError::Blockchain(BlockchainError::Timeout(_)))
+            Err(crate::domain::HealthCheckError::BlockchainUnavailable)
         ));
     }
 
@@ -770,7 +757,7 @@ mod tests {
             &self,
             _method: &str,
             _params: serde_json::Value,
-        ) -> Result<serde_json::Value, AppError> {
+        ) -> Result<serde_json::Value, BlockchainError> {
             let mut count = self.call_count.lock().unwrap();
             let idx = *count;
             *count += 1;
@@ -780,20 +767,18 @@ mod tests {
             if idx < responses.len() {
                 match &responses[idx] {
                     Ok(v) => Ok(v.clone()),
-                    Err(MockErrorKind::Timeout(msg)) => {
-                        Err(AppError::Blockchain(BlockchainError::Timeout(msg.clone())))
-                    }
+                    Err(MockErrorKind::Timeout(msg)) => Err(BlockchainError::Timeout(msg.clone())),
                     Err(MockErrorKind::RpcError(msg)) => {
-                        Err(AppError::Blockchain(BlockchainError::RpcError(msg.clone())))
+                        Err(BlockchainError::SubmissionFailed(msg.clone()))
                     }
                     Err(MockErrorKind::InsufficientFunds) => {
-                        Err(AppError::Blockchain(BlockchainError::InsufficientFunds))
+                        Err(BlockchainError::InsufficientFunds)
                     }
-                    Err(MockErrorKind::TransactionFailed(msg)) => Err(AppError::Blockchain(
-                        BlockchainError::TransactionFailed(msg.clone()),
-                    )),
-                    Err(MockErrorKind::EmptyResponse) => Err(AppError::Blockchain(
-                        BlockchainError::RpcError("Empty response".to_string()),
+                    Err(MockErrorKind::TransactionFailed(msg)) => {
+                        Err(BlockchainError::SubmissionFailed(msg.clone()))
+                    }
+                    Err(MockErrorKind::EmptyResponse) => Err(BlockchainError::SubmissionFailed(
+                        "Empty response".to_string(),
                     )),
                 }
             } else {
@@ -826,7 +811,7 @@ mod tests {
         let result = client.health_check().await;
         assert!(matches!(
             result,
-            Err(AppError::Blockchain(BlockchainError::InsufficientFunds))
+            Err(crate::domain::HealthCheckError::BlockchainUnavailable)
         ));
     }
 
@@ -842,12 +827,10 @@ mod tests {
         let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
 
         let result = client.health_check().await;
-        match result {
-            Err(AppError::Blockchain(BlockchainError::Timeout(msg))) => {
-                assert!(msg.contains("timed out"));
-            }
-            _ => panic!("Expected timeout error"),
-        }
+        assert!(matches!(
+            result,
+            Err(crate::domain::HealthCheckError::BlockchainUnavailable)
+        ));
     }
 
     #[tokio::test]
@@ -862,12 +845,10 @@ mod tests {
         let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
 
         let result = client.health_check().await;
-        match result {
-            Err(AppError::Blockchain(BlockchainError::RpcError(msg))) => {
-                assert!(msg.contains("Server is busy"));
-            }
-            _ => panic!("Expected RPC error"),
-        }
+        assert!(matches!(
+            result,
+            Err(crate::domain::HealthCheckError::BlockchainUnavailable)
+        ));
     }
 
     // --- DESERIALIZATION TESTS ---
@@ -1012,10 +993,7 @@ mod tests {
         let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
 
         let result = client.get_transaction_status("failed_sig").await;
-        assert!(matches!(
-            result,
-            Err(AppError::Blockchain(BlockchainError::TransactionFailed(_)))
-        ));
+        assert!(matches!(result, Err(BlockchainError::SubmissionFailed(_))));
     }
 
     // --- BLOCKHASH AND BLOCK HEIGHT TESTS ---
@@ -1101,10 +1079,7 @@ mod tests {
 
         tokio::time::pause();
         let result = client.wait_for_confirmation("never_confirmed", 1).await;
-        assert!(matches!(
-            result,
-            Err(AppError::Blockchain(BlockchainError::Timeout(_)))
-        ));
+        assert!(matches!(result, Err(BlockchainError::Timeout(_))));
     }
 
     #[tokio::test]
@@ -1119,10 +1094,7 @@ mod tests {
         let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
 
         let result = client.wait_for_confirmation("failed_tx", 5).await;
-        assert!(matches!(
-            result,
-            Err(AppError::Blockchain(BlockchainError::TransactionFailed(_)))
-        ));
+        assert!(matches!(result, Err(BlockchainError::SubmissionFailed(_))));
     }
 
     // --- SUBMIT TRANSACTION TESTS (MOCK MODE) ---
@@ -1179,10 +1151,10 @@ mod tests {
         let result = client.health_check().await;
         assert!(matches!(
             result,
-            Err(AppError::Blockchain(BlockchainError::InsufficientFunds))
+            Err(crate::domain::HealthCheckError::BlockchainUnavailable)
         ));
         // Note: We can't check the provider's state after moving it into Box
-        // The test validates that InsufficientFunds is eventually returned after retries
+        // The test validates that provider failure is surfaced as BlockchainUnavailable
     }
 
     // --- WITH_PROVIDER CONSTRUCTOR TEST ---
@@ -1331,8 +1303,8 @@ mod tests {
         // get_block_height expects u64, but we return a string
         let result = client.get_block_height().await;
         match result {
-            Err(AppError::Blockchain(BlockchainError::RpcError(msg))) => {
-                assert!(msg.contains("Deserialization error"));
+            Err(BlockchainError::SubmissionFailed(msg)) => {
+                assert!(msg.contains("Deserialization"));
             }
             _ => panic!("Expected deserialization error, got {:?}", result),
         }
@@ -1406,10 +1378,7 @@ mod tests {
 
             // Invalid base58 blockhash
             let result = client.build_memo_transaction("test_memo", "invalid!!!");
-            assert!(matches!(
-                result,
-                Err(AppError::Blockchain(BlockchainError::InvalidSignature(_)))
-            ));
+            assert!(matches!(result, Err(BlockchainError::SubmissionFailed(_))));
         }
 
         #[tokio::test]

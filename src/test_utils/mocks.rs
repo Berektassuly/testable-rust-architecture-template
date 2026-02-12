@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::domain::{
-    AppError, BlockchainClient, BlockchainError, BlockchainStatus, CreateItemRequest,
-    DatabaseClient, DatabaseError, Item, ItemMetadata, OutboxStatus, PaginatedResponse,
+    BlockchainClient, BlockchainError, BlockchainStatus, CreateItemRequest, DatabaseClient,
+    HealthCheckError, Item, ItemError, ItemMetadata, OutboxStatus, PaginatedResponse,
     SolanaOutboxEntry, SolanaOutboxPayload, build_solana_outbox_payload_from_request,
 };
 
@@ -72,14 +72,9 @@ impl MockDatabaseClient {
         self.storage.lock().unwrap().values().cloned().collect()
     }
 
-    fn check_should_fail(&self) -> Result<(), AppError> {
+    fn check_should_fail(&self) -> Result<(), ItemError> {
         if self.config.should_fail {
-            let msg = self
-                .config
-                .error_message
-                .clone()
-                .unwrap_or_else(|| "Mock error".to_string());
-            return Err(AppError::Database(DatabaseError::Query(msg)));
+            return Err(ItemError::RepositoryFailure);
         }
         Ok(())
     }
@@ -93,22 +88,21 @@ impl Default for MockDatabaseClient {
 
 #[async_trait]
 impl DatabaseClient for MockDatabaseClient {
-    async fn health_check(&self) -> Result<(), AppError> {
+    async fn health_check(&self) -> Result<(), HealthCheckError> {
         if !self.is_healthy.load(Ordering::Relaxed) {
-            return Err(AppError::Database(DatabaseError::Connection(
-                "Unhealthy".to_string(),
-            )));
+            return Err(HealthCheckError::DatabaseUnavailable);
         }
         self.check_should_fail()
+            .map_err(|_| HealthCheckError::DatabaseUnavailable)
     }
 
-    async fn get_item(&self, id: &str) -> Result<Option<Item>, AppError> {
+    async fn get_item(&self, id: &str) -> Result<Option<Item>, ItemError> {
         self.check_should_fail()?;
         let storage = self.storage.lock().unwrap();
         Ok(storage.get(id).cloned())
     }
 
-    async fn create_item(&self, data: &CreateItemRequest) -> Result<Item, AppError> {
+    async fn create_item(&self, data: &CreateItemRequest) -> Result<Item, ItemError> {
         self.check_should_fail()?;
         let id = format!("item_{}", uuid::Uuid::new_v4());
         let now = Utc::now();
@@ -152,7 +146,7 @@ impl DatabaseClient for MockDatabaseClient {
         &self,
         limit: i64,
         cursor: Option<&str>,
-    ) -> Result<PaginatedResponse<Item>, AppError> {
+    ) -> Result<PaginatedResponse<Item>, ItemError> {
         self.check_should_fail()?;
         let storage = self.storage.lock().unwrap();
         let mut items: Vec<Item> = storage.values().cloned().collect();
@@ -164,12 +158,7 @@ impl DatabaseClient for MockDatabaseClient {
             match pos {
                 Some(p) => items.into_iter().skip(p + 1).collect(),
                 None => {
-                    return Err(AppError::Validation(
-                        crate::domain::ValidationError::InvalidField {
-                            field: "cursor".to_string(),
-                            message: "Invalid cursor".to_string(),
-                        },
-                    ));
+                    return Err(ItemError::InvalidState("Invalid cursor".to_string()));
                 }
             }
         } else {
@@ -195,7 +184,7 @@ impl DatabaseClient for MockDatabaseClient {
         signature: Option<&str>,
         error: Option<&str>,
         next_retry_at: Option<DateTime<Utc>>,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), ItemError> {
         self.check_should_fail()?;
         let mut storage = self.storage.lock().unwrap();
         if let Some(item) = storage.get_mut(id) {
@@ -213,7 +202,7 @@ impl DatabaseClient for MockDatabaseClient {
     async fn claim_pending_solana_outbox(
         &self,
         limit: i64,
-    ) -> Result<Vec<SolanaOutboxEntry>, AppError> {
+    ) -> Result<Vec<SolanaOutboxEntry>, ItemError> {
         self.check_should_fail()?;
         let now = Utc::now();
         let storage = self.storage.lock().unwrap();
@@ -249,7 +238,7 @@ impl DatabaseClient for MockDatabaseClient {
         outbox_id: &str,
         item_id: &str,
         signature: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), ItemError> {
         self.check_should_fail()?;
         let mut storage = self.storage.lock().unwrap();
         if let Some(item) = storage.get_mut(item_id) {
@@ -277,7 +266,7 @@ impl DatabaseClient for MockDatabaseClient {
         item_status: BlockchainStatus,
         error: &str,
         next_retry_at: Option<DateTime<Utc>>,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), ItemError> {
         self.check_should_fail()?;
         let mut storage = self.storage.lock().unwrap();
         if let Some(item) = storage.get_mut(item_id) {
@@ -301,13 +290,13 @@ impl DatabaseClient for MockDatabaseClient {
         &self,
         item_id: &str,
         payload: &SolanaOutboxPayload,
-    ) -> Result<Item, AppError> {
+    ) -> Result<Item, ItemError> {
         self.check_should_fail()?;
         let now = Utc::now();
         let mut storage = self.storage.lock().unwrap();
         let item = storage
             .get_mut(item_id)
-            .ok_or_else(|| AppError::Database(DatabaseError::NotFound(item_id.to_string())))?;
+            .ok_or_else(|| ItemError::NotFound(item_id.to_string()))?;
 
         let outbox_entry = SolanaOutboxEntry {
             id: uuid::Uuid::new_v4().to_string(),
@@ -329,7 +318,7 @@ impl DatabaseClient for MockDatabaseClient {
         Ok(item.clone())
     }
 
-    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, AppError> {
+    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, ItemError> {
         self.check_should_fail()?;
         let storage = self.storage.lock().unwrap();
         let now = Utc::now();
@@ -346,7 +335,7 @@ impl DatabaseClient for MockDatabaseClient {
         Ok(items.into_iter().take(limit as usize).collect())
     }
 
-    async fn increment_retry_count(&self, id: &str) -> Result<i32, AppError> {
+    async fn increment_retry_count(&self, id: &str) -> Result<i32, ItemError> {
         self.check_should_fail()?;
         let mut storage = self.storage.lock().unwrap();
         if let Some(item) = storage.get_mut(id) {
@@ -354,7 +343,7 @@ impl DatabaseClient for MockDatabaseClient {
             item.updated_at = Utc::now();
             Ok(item.blockchain_retry_count)
         } else {
-            Err(AppError::Database(DatabaseError::NotFound(id.to_string())))
+            Err(ItemError::NotFound(id.to_string()))
         }
     }
 }
@@ -394,16 +383,14 @@ impl MockBlockchainClient {
         self.transactions.lock().unwrap().clone()
     }
 
-    fn check_should_fail(&self) -> Result<(), AppError> {
+    fn check_should_fail(&self) -> Result<(), BlockchainError> {
         if self.config.should_fail {
             let msg = self
                 .config
                 .error_message
                 .clone()
                 .unwrap_or_else(|| "Mock error".to_string());
-            return Err(AppError::Blockchain(BlockchainError::TransactionFailed(
-                msg,
-            )));
+            return Err(BlockchainError::SubmissionFailed(msg));
         }
         Ok(())
     }
@@ -417,16 +404,15 @@ impl Default for MockBlockchainClient {
 
 #[async_trait]
 impl BlockchainClient for MockBlockchainClient {
-    async fn health_check(&self) -> Result<(), AppError> {
+    async fn health_check(&self) -> Result<(), HealthCheckError> {
         if !self.is_healthy.load(Ordering::Relaxed) {
-            return Err(AppError::Blockchain(BlockchainError::Connection(
-                "Unhealthy".to_string(),
-            )));
+            return Err(HealthCheckError::BlockchainUnavailable);
         }
         self.check_should_fail()
+            .map_err(|_| HealthCheckError::BlockchainUnavailable)
     }
 
-    async fn submit_transaction(&self, hash: &str) -> Result<String, AppError> {
+    async fn submit_transaction(&self, hash: &str) -> Result<String, BlockchainError> {
         self.check_should_fail()?;
         let signature = format!("sig_{}", hash);
         let mut transactions = self.transactions.lock().unwrap();
@@ -434,18 +420,18 @@ impl BlockchainClient for MockBlockchainClient {
         Ok(signature)
     }
 
-    async fn get_transaction_status(&self, signature: &str) -> Result<bool, AppError> {
+    async fn get_transaction_status(&self, signature: &str) -> Result<bool, BlockchainError> {
         self.check_should_fail()?;
         let transactions = self.transactions.lock().unwrap();
         Ok(transactions.iter().any(|t| signature.contains(t)))
     }
 
-    async fn get_block_height(&self) -> Result<u64, AppError> {
+    async fn get_block_height(&self) -> Result<u64, BlockchainError> {
         self.check_should_fail()?;
         Ok(12345678)
     }
 
-    async fn get_latest_blockhash(&self) -> Result<String, AppError> {
+    async fn get_latest_blockhash(&self) -> Result<String, BlockchainError> {
         self.check_should_fail()?;
         Ok("mock_blockhash_abc123".to_string())
     }
@@ -454,7 +440,7 @@ impl BlockchainClient for MockBlockchainClient {
         &self,
         signature: &str,
         _timeout_secs: u64,
-    ) -> Result<bool, AppError> {
+    ) -> Result<bool, BlockchainError> {
         self.check_should_fail()?;
         let transactions = self.transactions.lock().unwrap();
         Ok(transactions.iter().any(|t| signature.contains(t)))

@@ -4,9 +4,7 @@ pub mod error;
 pub mod traits;
 pub mod types;
 
-pub use error::{
-    AppError, BlockchainError, ConfigError, DatabaseError, ExternalServiceError, ValidationError,
-};
+pub use error::{BlockchainError, ConfigError, HealthCheckError, ItemError, ValidationError};
 pub use traits::{BlockchainClient, DatabaseClient};
 pub use types::{
     BlockchainStatus, CreateItemRequest, ErrorDetail, ErrorResponse, HealthResponse, HealthStatus,

@@ -275,8 +275,9 @@ mod tests {
 
         use crate::app::AppState;
         use crate::domain::{
-            AppError, BlockchainClient, BlockchainStatus, CreateItemRequest, DatabaseClient, Item,
-            OutboxStatus, PaginatedResponse, SolanaOutboxEntry, SolanaOutboxPayload,
+            BlockchainClient, BlockchainError, BlockchainStatus, CreateItemRequest, DatabaseClient,
+            HealthCheckError, Item, ItemError, OutboxStatus, PaginatedResponse, SolanaOutboxEntry,
+            SolanaOutboxPayload,
         };
 
         #[derive(Clone)]
@@ -284,15 +285,15 @@ mod tests {
 
         #[async_trait]
         impl DatabaseClient for MockDatabaseClient {
-            async fn health_check(&self) -> Result<(), AppError> {
+            async fn health_check(&self) -> Result<(), HealthCheckError> {
                 Ok(())
             }
 
-            async fn get_item(&self, _id: &str) -> Result<Option<Item>, AppError> {
+            async fn get_item(&self, _id: &str) -> Result<Option<Item>, ItemError> {
                 Ok(None)
             }
 
-            async fn create_item(&self, _data: &CreateItemRequest) -> Result<Item, AppError> {
+            async fn create_item(&self, _data: &CreateItemRequest) -> Result<Item, ItemError> {
                 unimplemented!()
             }
 
@@ -300,7 +301,7 @@ mod tests {
                 &self,
                 _limit: i64,
                 _cursor: Option<&str>,
-            ) -> Result<PaginatedResponse<Item>, AppError> {
+            ) -> Result<PaginatedResponse<Item>, ItemError> {
                 unimplemented!()
             }
 
@@ -311,14 +312,14 @@ mod tests {
                 _signature: Option<&str>,
                 _error: Option<&str>,
                 _next_retry_at: Option<DateTime<Utc>>,
-            ) -> Result<(), AppError> {
+            ) -> Result<(), ItemError> {
                 Ok(())
             }
 
             async fn claim_pending_solana_outbox(
                 &self,
                 _limit: i64,
-            ) -> Result<Vec<SolanaOutboxEntry>, AppError> {
+            ) -> Result<Vec<SolanaOutboxEntry>, ItemError> {
                 Ok(vec![])
             }
 
@@ -327,7 +328,7 @@ mod tests {
                 _outbox_id: &str,
                 _item_id: &str,
                 _signature: &str,
-            ) -> Result<(), AppError> {
+            ) -> Result<(), ItemError> {
                 Ok(())
             }
 
@@ -340,7 +341,7 @@ mod tests {
                 _item_status: BlockchainStatus,
                 _error: &str,
                 _next_retry_at: Option<DateTime<Utc>>,
-            ) -> Result<(), AppError> {
+            ) -> Result<(), ItemError> {
                 Ok(())
             }
 
@@ -348,18 +349,18 @@ mod tests {
                 &self,
                 _item_id: &str,
                 _payload: &SolanaOutboxPayload,
-            ) -> Result<Item, AppError> {
+            ) -> Result<Item, ItemError> {
                 Ok(Item::default())
             }
 
             async fn get_pending_blockchain_items(
                 &self,
                 _limit: i64,
-            ) -> Result<Vec<Item>, AppError> {
+            ) -> Result<Vec<Item>, ItemError> {
                 Ok(vec![])
             }
 
-            async fn increment_retry_count(&self, _id: &str) -> Result<i32, AppError> {
+            async fn increment_retry_count(&self, _id: &str) -> Result<i32, ItemError> {
                 Ok(0)
             }
         }
@@ -369,11 +370,11 @@ mod tests {
 
         #[async_trait]
         impl BlockchainClient for MockBlockchainClient {
-            async fn health_check(&self) -> Result<(), AppError> {
+            async fn health_check(&self) -> Result<(), HealthCheckError> {
                 Ok(())
             }
 
-            async fn submit_transaction(&self, _hash: &str) -> Result<String, AppError> {
+            async fn submit_transaction(&self, _hash: &str) -> Result<String, BlockchainError> {
                 Ok("tx".into())
             }
         }

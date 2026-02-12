@@ -2,4 +2,4 @@
 
 pub mod postgres;
 
-pub use postgres::{PostgresClient, PostgresConfig};
+pub use postgres::{PostgresClient, PostgresConfig, PostgresInitError};

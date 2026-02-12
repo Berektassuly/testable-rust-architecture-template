@@ -1,16 +1,40 @@
 //! PostgreSQL database client implementation.
+//! Maps sqlx errors to domain ItemError / HealthCheckError; does not leak SQL or driver details.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions, types::Json};
 use std::time::Duration;
+use thiserror::Error;
 use tracing::{info, instrument};
 
 use crate::domain::{
-    AppError, BlockchainStatus, CreateItemRequest, DatabaseClient, DatabaseError, Item,
+    BlockchainStatus, CreateItemRequest, DatabaseClient, HealthCheckError, Item, ItemError,
     ItemMetadata, OutboxStatus, PaginatedResponse, SolanaOutboxEntry, SolanaOutboxPayload,
     build_solana_outbox_payload_from_request,
 };
+
+/// Error for Postgres client construction and migrations (used by main only).
+#[derive(Error, Debug)]
+pub enum PostgresInitError {
+    #[error("Connection failed: {0}")]
+    Connection(String),
+    #[error("Migration failed: {0}")]
+    Migration(String),
+}
+
+fn map_sqlx_to_item_error(e: sqlx::Error) -> ItemError {
+    match &e {
+        sqlx::Error::RowNotFound => ItemError::NotFound("Row not found".to_string()),
+        sqlx::Error::Database(db_err) => {
+            if db_err.code().as_deref() == Some("23505") {
+                return ItemError::InvalidState("Duplicate".to_string());
+            }
+            ItemError::RepositoryFailure
+        }
+        _ => ItemError::RepositoryFailure,
+    }
+}
 
 /// PostgreSQL connection pool configuration
 #[derive(Debug, Clone)]
@@ -41,7 +65,10 @@ pub struct PostgresClient {
 
 impl PostgresClient {
     /// Create a new PostgreSQL client with custom configuration
-    pub async fn new(database_url: &str, config: PostgresConfig) -> Result<Self, AppError> {
+    pub async fn new(
+        database_url: &str,
+        config: PostgresConfig,
+    ) -> Result<Self, PostgresInitError> {
         info!("Connecting to PostgreSQL...");
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
@@ -51,23 +78,23 @@ impl PostgresClient {
             .max_lifetime(config.max_lifetime)
             .connect(database_url)
             .await
-            .map_err(|e| AppError::Database(DatabaseError::Connection(e.to_string())))?;
+            .map_err(|e| PostgresInitError::Connection(e.to_string()))?;
         info!("Connected to PostgreSQL");
         Ok(Self { pool })
     }
 
     /// Create a new PostgreSQL client with default configuration
-    pub async fn with_defaults(database_url: &str) -> Result<Self, AppError> {
+    pub async fn with_defaults(database_url: &str) -> Result<Self, PostgresInitError> {
         Self::new(database_url, PostgresConfig::default()).await
     }
 
     /// Run database migrations using sqlx migrate
-    pub async fn run_migrations(&self) -> Result<(), AppError> {
+    pub async fn run_migrations(&self) -> Result<(), PostgresInitError> {
         info!("Running database migrations...");
         sqlx::migrate!("./migrations")
             .run(&self.pool)
             .await
-            .map_err(|e| AppError::Database(DatabaseError::Migration(e.to_string())))?;
+            .map_err(|e| PostgresInitError::Migration(e.to_string()))?;
         info!("Database migrations completed successfully");
         Ok(())
     }
@@ -79,7 +106,7 @@ impl PostgresClient {
     }
 
     /// Parse a database row into an Item
-    fn row_to_item(row: &sqlx::postgres::PgRow) -> Result<Item, AppError> {
+    fn row_to_item(row: &sqlx::postgres::PgRow) -> Result<Item, ItemError> {
         let metadata: Option<serde_json::Value> = row.try_get("metadata").ok();
         let status_str: String = row.get("blockchain_status");
 
@@ -101,10 +128,10 @@ impl PostgresClient {
     }
 
     /// Parse a database row into a Solana outbox entry
-    fn row_to_outbox(row: &sqlx::postgres::PgRow) -> Result<SolanaOutboxEntry, AppError> {
+    fn row_to_outbox(row: &sqlx::postgres::PgRow) -> Result<SolanaOutboxEntry, ItemError> {
         let payload: Json<SolanaOutboxPayload> = row
             .try_get("payload")
-            .map_err(|e| AppError::Deserialization(e.to_string()))?;
+            .map_err(|_| ItemError::RepositoryFailure)?;
         let status_str: String = row.get("status");
 
         Ok(SolanaOutboxEntry {
@@ -121,16 +148,16 @@ impl PostgresClient {
 #[async_trait]
 impl DatabaseClient for PostgresClient {
     #[instrument(skip(self))]
-    async fn health_check(&self) -> Result<(), AppError> {
+    async fn health_check(&self) -> Result<(), HealthCheckError> {
         sqlx::query("SELECT 1")
             .execute(&self.pool)
             .await
-            .map_err(|e| AppError::Database(DatabaseError::Connection(e.to_string())))?;
+            .map_err(|_| HealthCheckError::DatabaseUnavailable)?;
         Ok(())
     }
 
     #[instrument(skip(self))]
-    async fn get_item(&self, id: &str) -> Result<Option<Item>, AppError> {
+    async fn get_item(&self, id: &str) -> Result<Option<Item>, ItemError> {
         let row = sqlx::query(
             r#"
             SELECT id, hash, name, description, content, metadata, 
@@ -144,7 +171,7 @@ impl DatabaseClient for PostgresClient {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?;
+        .map_err(map_sqlx_to_item_error)?;
 
         match row {
             Some(row) => Ok(Some(Self::row_to_item(&row)?)),
@@ -153,7 +180,7 @@ impl DatabaseClient for PostgresClient {
     }
 
     #[instrument(skip(self, data), fields(item_name = %data.name))]
-    async fn create_item(&self, data: &CreateItemRequest) -> Result<Item, AppError> {
+    async fn create_item(&self, data: &CreateItemRequest) -> Result<Item, ItemError> {
         let id = format!("item_{}", uuid::Uuid::now_v7());
         let hash = format!("hash_{}", uuid::Uuid::now_v7());
         let now = Utc::now();
@@ -165,13 +192,9 @@ impl DatabaseClient for PostgresClient {
             .as_ref()
             .map(serde_json::to_value)
             .transpose()
-            .map_err(|e| AppError::Serialization(e.to_string()))?;
+            .map_err(|_| ItemError::RepositoryFailure)?;
 
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        let mut tx = self.pool.begin().await.map_err(map_sqlx_to_item_error)?;
 
         sqlx::query(
             r#"
@@ -193,7 +216,7 @@ impl DatabaseClient for PostgresClient {
         .bind(now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        .map_err(map_sqlx_to_item_error)?;
 
         sqlx::query(
             r#"
@@ -209,11 +232,9 @@ impl DatabaseClient for PostgresClient {
         .bind(0i32)
         .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        .map_err(map_sqlx_to_item_error)?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        tx.commit().await.map_err(map_sqlx_to_item_error)?;
 
         let metadata: Option<ItemMetadata> = data.metadata.as_ref().map(|m| ItemMetadata {
             author: m.author.clone(),
@@ -244,7 +265,7 @@ impl DatabaseClient for PostgresClient {
         &self,
         limit: i64,
         cursor: Option<&str>,
-    ) -> Result<PaginatedResponse<Item>, AppError> {
+    ) -> Result<PaginatedResponse<Item>, ItemError> {
         // Clamp limit to valid range
         let limit = limit.clamp(1, 100);
         // Fetch one extra to determine if there are more items
@@ -257,17 +278,12 @@ impl DatabaseClient for PostgresClient {
                     .bind(cursor_id)
                     .fetch_optional(&self.pool)
                     .await
-                    .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?;
+                    .map_err(map_sqlx_to_item_error)?;
 
                 let cursor_created_at: DateTime<Utc> = match cursor_row {
                     Some(row) => row.get("created_at"),
                     None => {
-                        return Err(AppError::Validation(
-                            crate::domain::ValidationError::InvalidField {
-                                field: "cursor".to_string(),
-                                message: "Invalid cursor".to_string(),
-                            },
-                        ));
+                        return Err(ItemError::InvalidState("Invalid cursor".to_string()));
                     }
                 };
 
@@ -288,7 +304,7 @@ impl DatabaseClient for PostgresClient {
                 .bind(fetch_limit)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?
+                .map_err(map_sqlx_to_item_error)?
             }
             None => sqlx::query(
                 r#"
@@ -304,7 +320,7 @@ impl DatabaseClient for PostgresClient {
             .bind(fetch_limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?,
+            .map_err(map_sqlx_to_item_error)?,
         };
 
         let has_more = rows.len() > limit as usize;
@@ -331,7 +347,7 @@ impl DatabaseClient for PostgresClient {
         signature: Option<&str>,
         error: Option<&str>,
         next_retry_at: Option<DateTime<Utc>>,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), ItemError> {
         let now = Utc::now();
 
         sqlx::query(
@@ -353,7 +369,7 @@ impl DatabaseClient for PostgresClient {
         .bind(id)
         .execute(&self.pool)
         .await
-        .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?;
+        .map_err(map_sqlx_to_item_error)?;
 
         Ok(())
     }
@@ -362,7 +378,7 @@ impl DatabaseClient for PostgresClient {
     async fn claim_pending_solana_outbox(
         &self,
         limit: i64,
-    ) -> Result<Vec<SolanaOutboxEntry>, AppError> {
+    ) -> Result<Vec<SolanaOutboxEntry>, ItemError> {
         let now = Utc::now();
         let rows = sqlx::query(
             r#"
@@ -387,7 +403,7 @@ impl DatabaseClient for PostgresClient {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?;
+        .map_err(map_sqlx_to_item_error)?;
 
         rows.iter().map(Self::row_to_outbox).collect()
     }
@@ -398,13 +414,9 @@ impl DatabaseClient for PostgresClient {
         outbox_id: &str,
         item_id: &str,
         signature: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), ItemError> {
         let now = Utc::now();
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        let mut tx = self.pool.begin().await.map_err(map_sqlx_to_item_error)?;
 
         sqlx::query(
             r#"
@@ -417,7 +429,7 @@ impl DatabaseClient for PostgresClient {
         .bind(outbox_id)
         .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        .map_err(map_sqlx_to_item_error)?;
 
         sqlx::query(
             r#"
@@ -436,11 +448,9 @@ impl DatabaseClient for PostgresClient {
         .bind(item_id)
         .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        .map_err(map_sqlx_to_item_error)?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        tx.commit().await.map_err(map_sqlx_to_item_error)?;
 
         Ok(())
     }
@@ -455,13 +465,9 @@ impl DatabaseClient for PostgresClient {
         item_status: BlockchainStatus,
         error: &str,
         next_retry_at: Option<DateTime<Utc>>,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), ItemError> {
         let now = Utc::now();
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        let mut tx = self.pool.begin().await.map_err(map_sqlx_to_item_error)?;
 
         sqlx::query(
             r#"
@@ -476,7 +482,7 @@ impl DatabaseClient for PostgresClient {
         .bind(outbox_id)
         .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        .map_err(map_sqlx_to_item_error)?;
 
         sqlx::query(
             r#"
@@ -497,11 +503,9 @@ impl DatabaseClient for PostgresClient {
         .bind(item_id)
         .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        .map_err(map_sqlx_to_item_error)?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        tx.commit().await.map_err(map_sqlx_to_item_error)?;
 
         Ok(())
     }
@@ -511,14 +515,10 @@ impl DatabaseClient for PostgresClient {
         &self,
         item_id: &str,
         payload: &SolanaOutboxPayload,
-    ) -> Result<Item, AppError> {
+    ) -> Result<Item, ItemError> {
         let now = Utc::now();
         let outbox_id = uuid::Uuid::now_v7();
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        let mut tx = self.pool.begin().await.map_err(map_sqlx_to_item_error)?;
 
         sqlx::query(
             r#"
@@ -534,7 +534,7 @@ impl DatabaseClient for PostgresClient {
         .bind(0i32)
         .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        .map_err(map_sqlx_to_item_error)?;
 
         let row = sqlx::query(
             r#"
@@ -556,17 +556,15 @@ impl DatabaseClient for PostgresClient {
         .bind(item_id)
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        .map_err(map_sqlx_to_item_error)?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(DatabaseError::from(e)))?;
+        tx.commit().await.map_err(map_sqlx_to_item_error)?;
 
         Self::row_to_item(&row)
     }
 
     #[instrument(skip(self))]
-    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, AppError> {
+    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, ItemError> {
         let now = Utc::now();
         let rows = sqlx::query(
             r#"
@@ -594,13 +592,13 @@ impl DatabaseClient for PostgresClient {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?;
+        .map_err(map_sqlx_to_item_error)?;
 
         rows.iter().map(Self::row_to_item).collect()
     }
 
     #[instrument(skip(self))]
-    async fn increment_retry_count(&self, id: &str) -> Result<i32, AppError> {
+    async fn increment_retry_count(&self, id: &str) -> Result<i32, ItemError> {
         let row = sqlx::query(
             r#"
             UPDATE items 
@@ -613,7 +611,7 @@ impl DatabaseClient for PostgresClient {
         .bind(id)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| AppError::Database(DatabaseError::Query(e.to_string())))?;
+        .map_err(map_sqlx_to_item_error)?;
 
         Ok(row.get("blockchain_retry_count"))
     }

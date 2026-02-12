@@ -12,7 +12,8 @@ use tower::ServiceExt;
 use testable_rust_architecture_template::api::create_router;
 use testable_rust_architecture_template::app::AppState;
 use testable_rust_architecture_template::domain::{
-    BlockchainStatus, CreateItemRequest, HealthResponse, HealthStatus, Item, PaginatedResponse,
+    BlockchainStatus, CreateItemRequest, DatabaseClient, HealthResponse, HealthStatus, Item,
+    PaginatedResponse,
 };
 use testable_rust_architecture_template::test_utils::{MockBlockchainClient, MockDatabaseClient};
 

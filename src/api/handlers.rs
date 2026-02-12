@@ -11,11 +11,10 @@ use axum::{
 use tracing::error;
 use utoipa::OpenApi;
 
-use crate::app::AppState;
+use crate::app::{AppState, CreateItemError};
 use crate::domain::{
-    AppError, BlockchainError, CreateItemRequest, DatabaseError, ErrorDetail, ErrorResponse,
-    ExternalServiceError, HealthResponse, HealthStatus, Item, PaginatedResponse, PaginationParams,
-    RateLimitResponse,
+    BlockchainError, CreateItemRequest, ErrorDetail, ErrorResponse, HealthResponse, HealthStatus,
+    Item, ItemError, PaginatedResponse, PaginationParams, RateLimitResponse, ValidationError,
 };
 
 /// OpenAPI documentation structure
@@ -82,7 +81,7 @@ pub struct ApiDoc;
 pub async fn create_item_handler(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateItemRequest>,
-) -> Result<Json<Item>, AppError> {
+) -> Result<Json<Item>, CreateItemError> {
     let item = state.service.create_and_submit_item(&payload).await?;
     Ok(Json(item))
 }
@@ -106,7 +105,7 @@ pub async fn create_item_handler(
 pub async fn list_items_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<PaginatedResponse<Item>>, AppError> {
+) -> Result<Json<PaginatedResponse<Item>>, ItemError> {
     // Validate limit
     let limit = params.limit.clamp(1, 100);
     let items = state
@@ -134,12 +133,12 @@ pub async fn list_items_handler(
 pub async fn get_item_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<Item>, AppError> {
+) -> Result<Json<Item>, ItemError> {
     let item = state
         .service
         .get_item(&id)
         .await?
-        .ok_or(AppError::Database(DatabaseError::NotFound(id)))?;
+        .ok_or_else(|| ItemError::NotFound(id))?;
     Ok(Json(item))
 }
 
@@ -163,7 +162,7 @@ pub async fn get_item_handler(
 pub async fn retry_blockchain_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<Item>, AppError> {
+) -> Result<Json<Item>, ItemError> {
     let item = state.service.retry_blockchain_submission(&id).await?;
     Ok(Json(item))
 }
@@ -213,126 +212,82 @@ pub async fn readiness_handler(State(state): State<Arc<AppState>>) -> StatusCode
     }
 }
 
-impl IntoResponse for AppError {
+fn error_response(
+    status: StatusCode,
+    error_type: &str,
+    message: String,
+) -> axum::response::Response {
+    if status.is_server_error() {
+        error!(error_type = %error_type, message = %message, "Server error");
+    }
+    let body = Json(ErrorResponse {
+        error: ErrorDetail {
+            r#type: error_type.to_string(),
+            message,
+        },
+    });
+    (status, body).into_response()
+}
+
+impl IntoResponse for ItemError {
     fn into_response(self) -> axum::response::Response {
         let (status, error_type, message) = match &self {
-            AppError::Database(db_err) => match db_err {
-                DatabaseError::Connection(_) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "database_error",
-                    self.to_string(),
-                ),
-                DatabaseError::NotFound(_) => {
-                    (StatusCode::NOT_FOUND, "not_found", self.to_string())
-                }
-                DatabaseError::Duplicate(_) => {
-                    (StatusCode::CONFLICT, "duplicate", self.to_string())
-                }
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "database_error",
-                    self.to_string(),
-                ),
-            },
-            AppError::Blockchain(bc_err) => match bc_err {
-                BlockchainError::Connection(_) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "blockchain_error",
-                    self.to_string(),
-                ),
-                BlockchainError::InsufficientFunds => (
-                    StatusCode::PAYMENT_REQUIRED,
-                    "insufficient_funds",
-                    self.to_string(),
-                ),
-                BlockchainError::Timeout(_) => {
-                    (StatusCode::GATEWAY_TIMEOUT, "timeout", self.to_string())
-                }
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "blockchain_error",
-                    self.to_string(),
-                ),
-            },
-            AppError::ExternalService(ext_err) => match ext_err {
-                ExternalServiceError::Unavailable(_) => (
-                    StatusCode::BAD_GATEWAY,
-                    "external_service_error",
-                    self.to_string(),
-                ),
-                ExternalServiceError::Timeout(_) => {
-                    (StatusCode::GATEWAY_TIMEOUT, "timeout", self.to_string())
-                }
-                ExternalServiceError::RateLimited(_) => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "rate_limited",
-                    self.to_string(),
-                ),
-                _ => (
-                    StatusCode::BAD_GATEWAY,
-                    "external_service_error",
-                    self.to_string(),
-                ),
-            },
-            AppError::Config(_) => (
+            ItemError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found", self.to_string()),
+            ItemError::InvalidState(_) => {
+                (StatusCode::BAD_REQUEST, "invalid_state", self.to_string())
+            }
+            ItemError::RepositoryFailure => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "configuration_error",
-                self.to_string(),
-            ),
-            AppError::Validation(_) => (
-                StatusCode::BAD_REQUEST,
-                "validation_error",
-                self.to_string(),
-            ),
-            AppError::Authentication(_) => (
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                self.to_string(),
-            ),
-            AppError::Authorization(_) => (
-                StatusCode::FORBIDDEN,
-                "authorization_error",
-                self.to_string(),
-            ),
-            AppError::Serialization(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "serialization_error",
-                self.to_string(),
-            ),
-            AppError::Deserialization(_) => (
-                StatusCode::BAD_REQUEST,
-                "deserialization_error",
-                self.to_string(),
-            ),
-            AppError::Internal(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                self.to_string(),
-            ),
-            AppError::NotSupported(_) => (
-                StatusCode::NOT_IMPLEMENTED,
-                "not_supported",
-                self.to_string(),
-            ),
-            AppError::RateLimited => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
-                "Rate limit exceeded".to_string(),
+                "repository_error",
+                "Internal server error".to_string(),
             ),
         };
+        error_response(status, error_type, message)
+    }
+}
 
-        if status.is_server_error() {
-            error!(error_type = %error_type, message = %message, "Server error");
+impl IntoResponse for BlockchainError {
+    fn into_response(self) -> axum::response::Response {
+        let (status, error_type, message) = match &self {
+            BlockchainError::SubmissionFailed(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "blockchain_error",
+                "Transaction submission failed".to_string(),
+            ),
+            BlockchainError::NetworkError(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "blockchain_unavailable",
+                "Blockchain service unavailable".to_string(),
+            ),
+            BlockchainError::InsufficientFunds => (
+                StatusCode::PAYMENT_REQUIRED,
+                "insufficient_funds",
+                self.to_string(),
+            ),
+            BlockchainError::Timeout(_) => {
+                (StatusCode::GATEWAY_TIMEOUT, "timeout", self.to_string())
+            }
+        };
+        error_response(status, error_type, message)
+    }
+}
+
+impl IntoResponse for ValidationError {
+    fn into_response(self) -> axum::response::Response {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_error",
+            self.to_string(),
+        )
+    }
+}
+
+impl IntoResponse for CreateItemError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            CreateItemError::Validation(e) => e.into_response(),
+            CreateItemError::Item(e) => e.into_response(),
         }
-
-        let body = Json(ErrorResponse {
-            error: ErrorDetail {
-                r#type: error_type.to_string(),
-                message,
-            },
-        });
-
-        (status, body).into_response()
     }
 }
 
@@ -424,10 +379,10 @@ mod tests {
         let result = get_item_handler(State(state), Path("non-existent-id".to_string())).await;
 
         match result {
-            Err(AppError::Database(DatabaseError::NotFound(id))) => {
+            Err(ItemError::NotFound(id)) => {
                 assert_eq!(id, "non-existent-id");
             }
-            _ => panic!("Expected DatabaseError::NotFound"),
+            _ => panic!("Expected ItemError::NotFound"),
         }
     }
 
@@ -477,192 +432,74 @@ mod tests {
     // --- Error Mapping Tests (IntoResponse) ---
 
     #[test]
-    fn test_error_mapping_database_not_found() {
-        let err = AppError::Database(DatabaseError::NotFound("123".into()));
+    fn test_error_mapping_item_not_found() {
+        let err = ItemError::NotFound("123".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
-    fn test_error_mapping_database_conflict() {
-        let err = AppError::Database(DatabaseError::Duplicate("key".into()));
+    fn test_error_mapping_item_invalid_state() {
+        let err = ItemError::InvalidState("invalid".into());
         let response = err.into_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_error_mapping_item_repository_failure() {
+        let err = ItemError::RepositoryFailure;
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
     fn test_error_mapping_blockchain_insufficient_funds() {
-        let err = AppError::Blockchain(BlockchainError::InsufficientFunds);
+        let err = BlockchainError::InsufficientFunds;
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
     }
 
     #[test]
     fn test_error_mapping_blockchain_timeout() {
-        let err = AppError::Blockchain(BlockchainError::Timeout("5000ms".into()));
+        let err = BlockchainError::Timeout("5000ms".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[test]
-    fn test_error_mapping_external_service_rate_limited() {
-        let err = AppError::ExternalService(ExternalServiceError::RateLimited("provider".into()));
+    fn test_error_mapping_blockchain_submission_failed() {
+        let err = BlockchainError::SubmissionFailed("rpc error".into());
         let response = err.into_response();
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_error_mapping_blockchain_network_error() {
+        let err = BlockchainError::NetworkError("refused".into());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
     fn test_error_mapping_validation_error() {
-        let err = AppError::Validation("Invalid email format".into());
+        let err = ValidationError::InvalidFormat("Invalid email format".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
-    fn test_error_mapping_auth_errors() {
-        let err_unauth = AppError::Authentication("Missing token".into());
-        assert_eq!(
-            err_unauth.into_response().status(),
-            StatusCode::UNAUTHORIZED
-        );
-
-        let err_forbidden = AppError::Authorization("Insufficient permissions".into());
-        assert_eq!(
-            err_forbidden.into_response().status(),
-            StatusCode::FORBIDDEN
-        );
-    }
-
-    #[test]
-    fn test_error_mapping_internal_errors() {
-        let err_internal = AppError::Internal("Unexpected failure".into());
-        assert_eq!(
-            err_internal.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-
-        let err_config = AppError::Config("Missing env var".into());
-        assert_eq!(
-            err_config.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn test_error_mapping_database_connection() {
-        let err = AppError::Database(DatabaseError::Connection("timeout".into()));
-        assert_eq!(
-            err.into_response().status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-    }
-
-    #[test]
-    fn test_error_mapping_database_query() {
-        let err = AppError::Database(DatabaseError::Query("syntax error".into()));
-        assert_eq!(
-            err.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn test_error_mapping_database_pool_exhausted() {
-        let err = AppError::Database(DatabaseError::PoolExhausted("no connections".into()));
-        assert_eq!(
-            err.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn test_error_mapping_database_migration() {
-        let err = AppError::Database(DatabaseError::Migration("failed".into()));
-        assert_eq!(
-            err.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn test_error_mapping_blockchain_connection() {
-        let err = AppError::Blockchain(BlockchainError::Connection("refused".into()));
-        assert_eq!(
-            err.into_response().status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-    }
-
-    #[test]
-    fn test_error_mapping_blockchain_rpc_error() {
-        let err = AppError::Blockchain(BlockchainError::RpcError("invalid method".into()));
-        assert_eq!(
-            err.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn test_error_mapping_blockchain_transaction_failed() {
-        let err = AppError::Blockchain(BlockchainError::TransactionFailed("nonce".into()));
-        assert_eq!(
-            err.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn test_error_mapping_blockchain_invalid_signature() {
-        let err = AppError::Blockchain(BlockchainError::InvalidSignature("corrupt".into()));
-        assert_eq!(
-            err.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn test_error_mapping_external_service_http_error() {
-        let err = AppError::ExternalService(ExternalServiceError::HttpError("404".into()));
-        assert_eq!(err.into_response().status(), StatusCode::BAD_GATEWAY);
-    }
-
-    #[test]
-    fn test_error_mapping_external_service_unavailable() {
-        let err = AppError::ExternalService(ExternalServiceError::Unavailable("down".into()));
-        assert_eq!(err.into_response().status(), StatusCode::BAD_GATEWAY);
-    }
-
-    #[test]
-    fn test_error_mapping_external_service_timeout() {
-        let err = AppError::ExternalService(ExternalServiceError::Timeout("30s".into()));
-        assert_eq!(err.into_response().status(), StatusCode::GATEWAY_TIMEOUT);
-    }
-
-    #[test]
-    fn test_error_mapping_serialization() {
-        let err = AppError::Serialization("json encode".into());
-        assert_eq!(
-            err.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn test_error_mapping_deserialization() {
-        let err = AppError::Deserialization("invalid json".into());
+    fn test_error_mapping_create_item_validation() {
+        let err = CreateItemError::Validation(ValidationError::MissingField("name".into()));
         assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
-    fn test_error_mapping_not_supported() {
-        let err = AppError::NotSupported("feature".into());
-        assert_eq!(err.into_response().status(), StatusCode::NOT_IMPLEMENTED);
-    }
-
-    #[test]
-    fn test_error_mapping_rate_limited() {
-        let err = AppError::RateLimited;
-        assert_eq!(err.into_response().status(), StatusCode::TOO_MANY_REQUESTS);
+    fn test_error_mapping_create_item_repository() {
+        let err = CreateItemError::Item(ItemError::RepositoryFailure);
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[tokio::test]
@@ -685,9 +522,6 @@ mod tests {
         let state = Arc::new(AppState::new(db, bc));
 
         let result = retry_blockchain_handler(State(state), Path("nonexistent".to_string())).await;
-        assert!(matches!(
-            result,
-            Err(AppError::Database(DatabaseError::NotFound(_)))
-        ));
+        assert!(matches!(result, Err(ItemError::NotFound(_))));
     }
 }
