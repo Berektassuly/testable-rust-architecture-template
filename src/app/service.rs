@@ -6,9 +6,9 @@ use tracing::{error, info, instrument, warn};
 use validator::Validate;
 
 use crate::domain::{
-    BlockchainClient, BlockchainStatus, CreateItemRequest, DatabaseClient, HealthResponse,
-    HealthStatus, Item, ItemError, OutboxStatus, PaginatedResponse, SolanaOutboxEntry,
-    ValidationError, build_solana_outbox_payload_from_item,
+    BlockchainClient, BlockchainStatus, CreateItemRequest, HealthResponse, HealthStatus, Item,
+    ItemError, ItemRepository, OutboxRepository, OutboxStatus, PaginatedResponse,
+    SolanaOutboxEntry, ValidationError, build_solana_outbox_payload_from_item,
 };
 
 /// Error type for create-item flow (validation or repository).
@@ -57,18 +57,21 @@ const MAX_BACKOFF_SECS: i64 = 300;
 
 /// Application service containing business logic
 pub struct AppService {
-    db_client: Arc<dyn DatabaseClient>,
+    item_repo: Arc<dyn ItemRepository>,
+    outbox_repo: Arc<dyn OutboxRepository>,
     blockchain_client: Arc<dyn BlockchainClient>,
 }
 
 impl AppService {
     #[must_use]
     pub fn new(
-        db_client: Arc<dyn DatabaseClient>,
+        item_repo: Arc<dyn ItemRepository>,
+        outbox_repo: Arc<dyn OutboxRepository>,
         blockchain_client: Arc<dyn BlockchainClient>,
     ) -> Self {
         Self {
-            db_client,
+            item_repo,
+            outbox_repo,
             blockchain_client,
         }
     }
@@ -85,7 +88,7 @@ impl AppService {
         })?;
 
         info!("Creating new item: {}", request.name);
-        let item = self.db_client.create_item(request).await?;
+        let item = self.item_repo.create_item(request).await?;
         info!(item_id = %item.id, "Item created and outbox queued");
 
         Ok(item)
@@ -94,7 +97,7 @@ impl AppService {
     /// Get an item by ID
     #[instrument(skip(self))]
     pub async fn get_item(&self, id: &str) -> Result<Option<Item>, ItemError> {
-        self.db_client.get_item(id).await
+        self.item_repo.get_item(id).await
     }
 
     /// List items with pagination
@@ -104,14 +107,14 @@ impl AppService {
         limit: i64,
         cursor: Option<&str>,
     ) -> Result<PaginatedResponse<Item>, ItemError> {
-        self.db_client.list_items(limit, cursor).await
+        self.item_repo.list_items(limit, cursor).await
     }
 
     /// Retry blockchain submission for a specific item
     #[instrument(skip(self))]
     pub async fn retry_blockchain_submission(&self, id: &str) -> Result<Item, ItemError> {
         let item = self
-            .db_client
+            .item_repo
             .get_item(id)
             .await?
             .ok_or_else(|| ItemError::NotFound(id.to_string()))?;
@@ -131,7 +134,7 @@ impl AppService {
 
         let payload = build_solana_outbox_payload_from_item(&item);
         let updated = self
-            .db_client
+            .item_repo
             .enqueue_solana_outbox_for_item(&item.id, &payload)
             .await?;
 
@@ -142,7 +145,7 @@ impl AppService {
     #[instrument(skip(self))]
     pub async fn process_pending_submissions(&self, batch_size: i64) -> Result<usize, ItemError> {
         let pending_entries = self
-            .db_client
+            .outbox_repo
             .claim_pending_solana_outbox(batch_size)
             .await?;
         let count = pending_entries.len();
@@ -179,7 +182,7 @@ impl AppService {
                     signature = %signature,
                     "Background submission successful"
                 );
-                self.db_client
+                self.outbox_repo
                     .complete_solana_outbox(&entry.id, &entry.aggregate_id, &signature)
                     .await?;
             }
@@ -203,7 +206,7 @@ impl AppService {
                     )
                 };
 
-                self.db_client
+                self.outbox_repo
                     .fail_solana_outbox(
                         &entry.id,
                         &entry.aggregate_id,
@@ -223,7 +226,7 @@ impl AppService {
     /// Perform health check on all dependencies
     #[instrument(skip(self))]
     pub async fn health_check(&self) -> HealthResponse {
-        let db_health = match self.db_client.health_check().await {
+        let db_health = match self.item_repo.health_check().await {
             Ok(()) => HealthStatus::Healthy,
             Err(_) => HealthStatus::Unhealthy,
         };
@@ -264,7 +267,7 @@ mod tests {
 mod service_tests {
     use super::*;
     use crate::domain::BlockchainStatus;
-    use crate::test_utils::{MockBlockchainClient, MockDatabaseClient};
+    use crate::test_utils::{MockBlockchainClient, MockProvider, mock_repos};
     use chrono::Utc;
     use std::sync::Arc;
 
@@ -272,9 +275,10 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_create_item_validation_error() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let service = AppService::new(db, bc);
+        let service = AppService::new(item_repo, outbox_repo, bc);
 
         // Name too short/empty assumes validation logic in CreateItemRequest
         // We simulate a request that fails validator::Validate
@@ -291,9 +295,10 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_create_item_does_not_submit_blockchain() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::failing("Chain down"));
-        let service = AppService::new(db, bc);
+        let service = AppService::new(item_repo, outbox_repo, bc);
 
         let request = CreateItemRequest {
             name: "Test Item".to_string(),
@@ -316,13 +321,14 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_retry_submission_invalid_state() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let service = AppService::new(db.clone(), bc);
+        let service = AppService::new(item_repo, outbox_repo, bc);
 
         let request = CreateItemRequest::new("Test".to_string(), "Content".to_string());
-        let created = db.create_item(&request).await.unwrap();
-        db.update_blockchain_status(
+        let created = mock.create_item(&request).await.unwrap();
+        mock.update_blockchain_status(
             &created.id,
             BlockchainStatus::Submitted,
             Some("sig"),
@@ -344,13 +350,14 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_retry_submission_failed_requeues() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let service = AppService::new(db.clone(), bc);
+        let service = AppService::new(item_repo, outbox_repo, bc);
 
         let request = CreateItemRequest::new("Retry".to_string(), "Content".to_string());
-        let created = db.create_item(&request).await.unwrap();
-        db.update_blockchain_status(
+        let created = mock.create_item(&request).await.unwrap();
+        mock.update_blockchain_status(
             &created.id,
             BlockchainStatus::Failed,
             None,
@@ -375,9 +382,10 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_process_pending_submissions_batch() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let service = AppService::new(db.clone(), bc);
+        let service = AppService::new(item_repo, outbox_repo, bc);
 
         let request1 = CreateItemRequest::new("Item1".to_string(), "Content".to_string());
         let request2 = CreateItemRequest::new("Item2".to_string(), "Content".to_string());
@@ -387,8 +395,8 @@ mod service_tests {
         let count = service.process_pending_submissions(10).await.unwrap();
         assert_eq!(count, 2);
 
-        let updated1 = db.get_item(&item1.id).await.unwrap().unwrap();
-        let updated2 = db.get_item(&item2.id).await.unwrap().unwrap();
+        let updated1 = mock.get_item(&item1.id).await.unwrap().unwrap();
+        let updated2 = mock.get_item(&item2.id).await.unwrap().unwrap();
 
         assert_eq!(updated1.blockchain_status, BlockchainStatus::Submitted);
         assert_eq!(updated2.blockchain_status, BlockchainStatus::Submitted);
@@ -398,10 +406,12 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_health_check_mixed() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, _outbox_repo) = mock_repos(&mock);
+        let other = Arc::new(MockProvider::new());
+        let (_, outbox_repo2) = mock_repos(&other);
         let bc = Arc::new(MockBlockchainClient::failing("unhealthy"));
-
-        let service = AppService::new(db, bc);
+        let service = AppService::new(item_repo, outbox_repo2, bc);
         let health = service.health_check().await;
 
         assert_eq!(health.status, HealthStatus::Unhealthy);
@@ -411,9 +421,10 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_retry_blockchain_submission_item_not_found() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let service = AppService::new(db, bc);
+        let service = AppService::new(item_repo, outbox_repo, bc);
 
         let result = service.retry_blockchain_submission("nonexistent").await;
 
@@ -422,13 +433,14 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_retry_blockchain_submission_failed_status() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let service = AppService::new(db.clone(), bc);
+        let service = AppService::new(item_repo, outbox_repo, bc);
 
         let request = CreateItemRequest::new("Failed".to_string(), "Content".to_string());
-        let created = db.create_item(&request).await.unwrap();
-        db.update_blockchain_status(
+        let created = mock.create_item(&request).await.unwrap();
+        mock.update_blockchain_status(
             &created.id,
             BlockchainStatus::Failed,
             None,
@@ -449,9 +461,10 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_process_pending_submissions_empty() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let service = AppService::new(db, bc);
+        let service = AppService::new(item_repo, outbox_repo, bc);
 
         let count = service.process_pending_submissions(10).await.unwrap();
         assert_eq!(count, 0);
@@ -459,9 +472,10 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_get_item_success() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let service = AppService::new(db, bc);
+        let service = AppService::new(item_repo, outbox_repo, bc);
 
         let request = CreateItemRequest::new("Test Item".to_string(), "Content".to_string());
         let created = service.create_and_submit_item(&request).await.unwrap();
@@ -473,9 +487,10 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_list_items_success() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let service = AppService::new(db, bc);
+        let service = AppService::new(item_repo, outbox_repo, bc);
 
         let result = service.list_items(10, None).await.unwrap();
         assert!(result.items.is_empty());
@@ -484,9 +499,10 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_create_item_blockchain_success() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let service = AppService::new(db.clone(), bc);
+        let service = AppService::new(item_repo, outbox_repo, bc);
         let request = CreateItemRequest {
             name: "Success Item".to_string(),
             description: Some("Description".to_string()),
@@ -504,9 +520,10 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_health_check_both_healthy() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let service = AppService::new(db, bc);
+        let service = AppService::new(item_repo, outbox_repo, bc);
         let health = service.health_check().await;
 
         assert_eq!(health.status, HealthStatus::Healthy);
@@ -516,9 +533,10 @@ mod service_tests {
 
     #[tokio::test]
     async fn test_process_pending_submissions_failure_updates_retry() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::failing("rpc error"));
-        let service = AppService::new(db.clone(), bc);
+        let service = AppService::new(item_repo, outbox_repo, bc);
 
         let request = CreateItemRequest::new("Retry Item".to_string(), "Content".to_string());
         let created = service.create_and_submit_item(&request).await.unwrap();
@@ -526,7 +544,7 @@ mod service_tests {
         let count = service.process_pending_submissions(10).await.unwrap();
         assert_eq!(count, 1);
 
-        let updated = db.get_item(&created.id).await.unwrap().unwrap();
+        let updated = mock.get_item(&created.id).await.unwrap().unwrap();
         assert_eq!(
             updated.blockchain_status,
             BlockchainStatus::PendingSubmission

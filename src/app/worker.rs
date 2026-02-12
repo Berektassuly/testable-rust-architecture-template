@@ -126,13 +126,14 @@ pub fn spawn_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{BlockchainStatus, CreateItemRequest, DatabaseClient};
-    use crate::test_utils::{MockBlockchainClient, MockConfig, MockDatabaseClient};
+    use crate::domain::{BlockchainStatus, CreateItemRequest, ItemRepository};
+    use crate::test_utils::{MockBlockchainClient, MockConfig, MockProvider, mock_repos};
 
     fn create_test_service() -> Arc<AppService> {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        Arc::new(AppService::new(db, bc))
+        Arc::new(AppService::new(item_repo, outbox_repo, bc))
     }
 
     #[test]
@@ -325,12 +326,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_batch_handles_service_error() {
-        // Use a failing database client
-        let db = Arc::new(MockDatabaseClient::with_config(MockConfig::failure(
+        // Use a failing mock provider
+        let mock = Arc::new(MockProvider::with_config(MockConfig::failure(
             "Database error",
         )));
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let service = Arc::new(AppService::new(db, bc));
+        let service = Arc::new(AppService::new(item_repo, outbox_repo, bc));
 
         let config = WorkerConfig {
             poll_interval: Duration::from_secs(10),
@@ -445,7 +447,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_once_processes_pending_items() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
 
         // Create an item that needs processing
@@ -455,10 +458,10 @@ mod tests {
             content: "Content".to_string(),
             metadata: None,
         };
-        let item = db.create_item(&request).await.unwrap();
+        let item = mock.create_item(&request).await.unwrap();
 
         // Update to pending submission status
-        db.update_blockchain_status(
+        mock.update_blockchain_status(
             &item.id,
             BlockchainStatus::PendingSubmission,
             None,
@@ -468,7 +471,7 @@ mod tests {
         .await
         .unwrap();
 
-        let service = Arc::new(AppService::new(db.clone(), bc));
+        let service = Arc::new(AppService::new(item_repo, outbox_repo, bc));
 
         let config = WorkerConfig {
             poll_interval: Duration::from_secs(10),
@@ -482,7 +485,7 @@ mod tests {
         worker.run_once().await;
 
         // Verify the item was processed
-        let updated = db.get_item(&item.id).await.unwrap().unwrap();
+        let updated = mock.get_item(&item.id).await.unwrap().unwrap();
         assert_eq!(updated.blockchain_status, BlockchainStatus::Submitted);
     }
 

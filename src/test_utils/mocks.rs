@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::domain::{
-    BlockchainClient, BlockchainError, BlockchainStatus, CreateItemRequest, DatabaseClient,
-    HealthCheckError, Item, ItemError, ItemMetadata, OutboxStatus, PaginatedResponse,
+    BlockchainClient, BlockchainError, BlockchainStatus, CreateItemRequest, HealthCheckError, Item,
+    ItemError, ItemMetadata, ItemRepository, OutboxRepository, OutboxStatus, PaginatedResponse,
     SolanaOutboxEntry, SolanaOutboxPayload, build_solana_outbox_payload_from_request,
 };
 
@@ -34,15 +34,16 @@ impl MockConfig {
     }
 }
 
-/// Mock database client for testing
-pub struct MockDatabaseClient {
+/// Mock provider implementing both ItemRepository and OutboxRepository with shared state.
+/// Creating an item via ItemRepository populates the outbox accessed via OutboxRepository.
+pub struct MockProvider {
     storage: Arc<Mutex<HashMap<String, Item>>>,
     outbox: Arc<Mutex<HashMap<String, SolanaOutboxEntry>>>,
     config: MockConfig,
     is_healthy: AtomicBool,
 }
 
-impl MockDatabaseClient {
+impl MockProvider {
     #[must_use]
     pub fn new() -> Self {
         Self::with_config(MockConfig::success())
@@ -80,14 +81,25 @@ impl MockDatabaseClient {
     }
 }
 
-impl Default for MockDatabaseClient {
+impl Default for MockProvider {
     fn default() -> Self {
         Self::new()
     }
 }
 
+/// Helper to use a single `MockProvider` as both repositories (shared state for tests).
+#[must_use]
+pub fn mock_repos(
+    mock: &Arc<MockProvider>,
+) -> (Arc<dyn ItemRepository>, Arc<dyn OutboxRepository>) {
+    (
+        Arc::clone(mock) as Arc<dyn ItemRepository>,
+        Arc::clone(mock) as Arc<dyn OutboxRepository>,
+    )
+}
+
 #[async_trait]
-impl DatabaseClient for MockDatabaseClient {
+impl ItemRepository for MockProvider {
     async fn health_check(&self) -> Result<(), HealthCheckError> {
         if !self.is_healthy.load(Ordering::Relaxed) {
             return Err(HealthCheckError::DatabaseUnavailable);
@@ -199,6 +211,78 @@ impl DatabaseClient for MockDatabaseClient {
         Ok(())
     }
 
+    async fn enqueue_solana_outbox_for_item(
+        &self,
+        item_id: &str,
+        payload: &SolanaOutboxPayload,
+    ) -> Result<Item, ItemError> {
+        self.check_should_fail()?;
+        let now = Utc::now();
+        let mut storage = self.storage.lock().unwrap();
+        let item = storage
+            .get_mut(item_id)
+            .ok_or_else(|| ItemError::NotFound(item_id.to_string()))?;
+
+        let outbox_entry = SolanaOutboxEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            aggregate_id: item_id.to_string(),
+            payload: payload.clone(),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            created_at: now,
+        };
+        let mut outbox = self.outbox.lock().unwrap();
+        outbox.insert(outbox_entry.id.clone(), outbox_entry);
+
+        item.blockchain_status = BlockchainStatus::PendingSubmission;
+        item.blockchain_last_error = None;
+        item.blockchain_next_retry_at = None;
+        item.blockchain_retry_count = 0;
+        item.updated_at = now;
+
+        Ok(item.clone())
+    }
+
+    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, ItemError> {
+        self.check_should_fail()?;
+        let storage = self.storage.lock().unwrap();
+        let now = Utc::now();
+        let mut items: Vec<Item> = storage
+            .values()
+            .filter(|i| {
+                i.blockchain_status == BlockchainStatus::PendingSubmission
+                    && i.blockchain_retry_count < 10
+                    && i.blockchain_next_retry_at.map(|t| t <= now).unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(items.into_iter().take(limit as usize).collect())
+    }
+
+    async fn increment_retry_count(&self, id: &str) -> Result<i32, ItemError> {
+        self.check_should_fail()?;
+        let mut storage = self.storage.lock().unwrap();
+        if let Some(item) = storage.get_mut(id) {
+            item.blockchain_retry_count += 1;
+            item.updated_at = Utc::now();
+            Ok(item.blockchain_retry_count)
+        } else {
+            Err(ItemError::NotFound(id.to_string()))
+        }
+    }
+}
+
+#[async_trait]
+impl OutboxRepository for MockProvider {
+    async fn health_check(&self) -> Result<(), HealthCheckError> {
+        if !self.is_healthy.load(Ordering::Relaxed) {
+            return Err(HealthCheckError::DatabaseUnavailable);
+        }
+        self.check_should_fail()
+            .map_err(|_| HealthCheckError::DatabaseUnavailable)
+    }
+
     async fn claim_pending_solana_outbox(
         &self,
         limit: i64,
@@ -284,67 +368,6 @@ impl DatabaseClient for MockDatabaseClient {
             entry.retry_count = retry_count;
         }
         Ok(())
-    }
-
-    async fn enqueue_solana_outbox_for_item(
-        &self,
-        item_id: &str,
-        payload: &SolanaOutboxPayload,
-    ) -> Result<Item, ItemError> {
-        self.check_should_fail()?;
-        let now = Utc::now();
-        let mut storage = self.storage.lock().unwrap();
-        let item = storage
-            .get_mut(item_id)
-            .ok_or_else(|| ItemError::NotFound(item_id.to_string()))?;
-
-        let outbox_entry = SolanaOutboxEntry {
-            id: uuid::Uuid::new_v4().to_string(),
-            aggregate_id: item_id.to_string(),
-            payload: payload.clone(),
-            status: OutboxStatus::Pending,
-            retry_count: 0,
-            created_at: now,
-        };
-        let mut outbox = self.outbox.lock().unwrap();
-        outbox.insert(outbox_entry.id.clone(), outbox_entry);
-
-        item.blockchain_status = BlockchainStatus::PendingSubmission;
-        item.blockchain_last_error = None;
-        item.blockchain_next_retry_at = None;
-        item.blockchain_retry_count = 0;
-        item.updated_at = now;
-
-        Ok(item.clone())
-    }
-
-    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, ItemError> {
-        self.check_should_fail()?;
-        let storage = self.storage.lock().unwrap();
-        let now = Utc::now();
-        let mut items: Vec<Item> = storage
-            .values()
-            .filter(|i| {
-                i.blockchain_status == BlockchainStatus::PendingSubmission
-                    && i.blockchain_retry_count < 10
-                    && i.blockchain_next_retry_at.map(|t| t <= now).unwrap_or(true)
-            })
-            .cloned()
-            .collect();
-        items.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-        Ok(items.into_iter().take(limit as usize).collect())
-    }
-
-    async fn increment_retry_count(&self, id: &str) -> Result<i32, ItemError> {
-        self.check_should_fail()?;
-        let mut storage = self.storage.lock().unwrap();
-        if let Some(item) = storage.get_mut(id) {
-            item.blockchain_retry_count += 1;
-            item.updated_at = Utc::now();
-            Ok(item.blockchain_retry_count)
-        } else {
-            Err(ItemError::NotFound(id.to_string()))
-        }
     }
 }
 

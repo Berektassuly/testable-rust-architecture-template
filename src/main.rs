@@ -150,9 +150,15 @@ async fn main() -> Result<()> {
         RpcBlockchainClient::with_defaults(&config.blockchain_rpc_url, config.signing_key)?;
     info!("   ✓ Blockchain client created");
 
-    // Create application state
+    // Create application state (PostgresClient implements both ItemRepository and OutboxRepository)
+    let db = Arc::new(postgres_client);
+    let item_repo =
+        Arc::clone(&db) as Arc<dyn testable_rust_architecture_template::domain::ItemRepository>;
+    let outbox_repo =
+        Arc::clone(&db) as Arc<dyn testable_rust_architecture_template::domain::OutboxRepository>;
     let app_state = Arc::new(AppState::new(
-        Arc::new(postgres_client),
+        item_repo,
+        outbox_repo,
         Arc::new(blockchain_client),
     ));
 

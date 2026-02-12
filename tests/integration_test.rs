@@ -12,15 +12,18 @@ use tower::ServiceExt;
 use testable_rust_architecture_template::api::create_router;
 use testable_rust_architecture_template::app::AppState;
 use testable_rust_architecture_template::domain::{
-    BlockchainStatus, CreateItemRequest, DatabaseClient, HealthResponse, HealthStatus, Item,
+    BlockchainStatus, CreateItemRequest, HealthResponse, HealthStatus, Item, ItemRepository,
     PaginatedResponse,
 };
-use testable_rust_architecture_template::test_utils::{MockBlockchainClient, MockDatabaseClient};
+use testable_rust_architecture_template::test_utils::{
+    MockBlockchainClient, MockProvider, mock_repos,
+};
 
 fn create_test_state() -> Arc<AppState> {
-    let db = Arc::new(MockDatabaseClient::new());
+    let mock = Arc::new(MockProvider::new());
+    let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
-    Arc::new(AppState::new(db, blockchain))
+    Arc::new(AppState::new(item_repo, outbox_repo, blockchain))
 }
 
 #[tokio::test]
@@ -87,12 +90,10 @@ async fn test_list_items_empty() {
 
 #[tokio::test]
 async fn test_list_items_with_pagination() {
-    let db = Arc::new(MockDatabaseClient::new());
+    let mock = Arc::new(MockProvider::new());
+    let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
-    let state = Arc::new(AppState::new(
-        Arc::clone(&db) as _,
-        Arc::clone(&blockchain) as _,
-    ));
+    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
 
     // Create some items
     for i in 0..5 {
@@ -141,12 +142,10 @@ async fn test_list_items_with_pagination() {
 
 #[tokio::test]
 async fn test_get_item_success() {
-    let db = Arc::new(MockDatabaseClient::new());
+    let mock = Arc::new(MockProvider::new());
+    let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
-    let state = Arc::new(AppState::new(
-        Arc::clone(&db) as _,
-        Arc::clone(&blockchain) as _,
-    ));
+    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
 
     // Create an item
     let payload = CreateItemRequest::new("Test Item".to_string(), "Content".to_string());
@@ -189,9 +188,10 @@ async fn test_get_item_not_found() {
 
 #[tokio::test]
 async fn test_graceful_degradation_blockchain_failure() {
-    let db = Arc::new(MockDatabaseClient::new());
+    let mock = Arc::new(MockProvider::new());
+    let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::failing("RPC error"));
-    let state = Arc::new(AppState::new(Arc::clone(&db) as _, blockchain));
+    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
     let router = create_router(state);
 
     let payload = CreateItemRequest::new("Test".to_string(), "Content".to_string());
@@ -265,10 +265,11 @@ async fn test_readiness_healthy() {
 
 #[tokio::test]
 async fn test_readiness_unhealthy() {
-    let db = Arc::new(MockDatabaseClient::new());
-    db.set_healthy(false);
+    let mock = Arc::new(MockProvider::new());
+    mock.set_healthy(false);
+    let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
-    let state = Arc::new(AppState::new(db, blockchain));
+    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
     let router = create_router(state);
 
     let request = Request::builder()
@@ -283,9 +284,10 @@ async fn test_readiness_unhealthy() {
 
 #[tokio::test]
 async fn test_database_failure() {
-    let db = Arc::new(MockDatabaseClient::failing("DB error"));
+    let mock = Arc::new(MockProvider::failing("DB error"));
+    let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
-    let state = Arc::new(AppState::new(db, blockchain));
+    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
     let router = create_router(state);
 
     let payload = CreateItemRequest::new("Test".to_string(), "Content".to_string());
@@ -354,12 +356,10 @@ async fn test_retry_handler_item_not_found() {
 
 #[tokio::test]
 async fn test_retry_handler_not_eligible() {
-    let db = Arc::new(MockDatabaseClient::new());
+    let mock = Arc::new(MockProvider::new());
+    let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
-    let state = Arc::new(AppState::new(
-        Arc::clone(&db) as _,
-        Arc::clone(&blockchain) as _,
-    ));
+    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
 
     // Create an item and force it to Submitted status (not eligible for retry)
     let payload = CreateItemRequest::new("Test Item".to_string(), "Content".to_string());
@@ -368,7 +368,7 @@ async fn test_retry_handler_not_eligible() {
         .create_and_submit_item(&payload)
         .await
         .unwrap();
-    db.update_blockchain_status(
+    mock.update_blockchain_status(
         &created_item.id,
         BlockchainStatus::Submitted,
         Some("sig"),
@@ -425,10 +425,11 @@ async fn test_list_items_invalid_limit() {
 
 #[tokio::test]
 async fn test_health_check_degraded() {
-    let db = Arc::new(MockDatabaseClient::new());
+    let mock = Arc::new(MockProvider::new());
+    let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
     blockchain.set_healthy(false);
-    let state = Arc::new(AppState::new(db, blockchain));
+    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
     let router = create_router(state);
 
     let request = Request::builder()

@@ -294,14 +294,15 @@ impl IntoResponse for CreateItemError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::DatabaseClient;
-    use crate::test_utils::{MockBlockchainClient, MockDatabaseClient};
+    use crate::domain::ItemRepository;
+    use crate::test_utils::{MockBlockchainClient, MockProvider, mock_repos};
 
     #[tokio::test]
     async fn test_create_item_handler() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(db, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
 
         let payload = CreateItemRequest {
             name: "Test Item".to_string(),
@@ -322,13 +323,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_item_handler() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(db.clone(), bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
 
         // Seed item
         let req = CreateItemRequest::new("Seed".to_string(), "Content".to_string());
-        let created = db.create_item(&req).await.unwrap();
+        let created = mock.create_item(&req).await.unwrap();
 
         let result = get_item_handler(State(state), Path(created.id.clone())).await;
         assert!(result.is_ok());
@@ -338,18 +340,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check_handler() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(db, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
 
         let Json(resp) = health_check_handler(State(state)).await;
         assert_eq!(resp.status, HealthStatus::Healthy);
     }
     #[tokio::test]
     async fn test_list_items_handler_pagination_clamping() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(db, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
 
         // Test with limit > 100
         let params_high = PaginationParams {
@@ -372,9 +376,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_item_handler_not_found() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(db, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
 
         let result = get_item_handler(State(state), Path("non-existent-id".to_string())).await;
 
@@ -388,16 +393,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_blockchain_handler_success() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(db.clone(), bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
 
         // Seed item
         let req = CreateItemRequest::new("Retry Item".to_string(), "Content".to_string());
-        let created = db.create_item(&req).await.unwrap();
+        let created = mock.create_item(&req).await.unwrap();
 
         // Update status to be eligible for retry
-        db.update_blockchain_status(
+        mock.update_blockchain_status(
             &created.id,
             crate::domain::BlockchainStatus::PendingSubmission,
             None,
@@ -421,9 +427,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_readiness_handler_healthy() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(db, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
 
         let status = readiness_handler(State(state)).await;
         assert_eq!(status, StatusCode::OK);
@@ -505,10 +512,11 @@ mod tests {
     #[tokio::test]
     async fn test_readiness_handler_degraded() {
         // When blockchain is unhealthy but db healthy = degraded (returns OK)
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
         bc.set_healthy(false);
-        let state = Arc::new(AppState::new(db, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
 
         let status = readiness_handler(State(state)).await;
         // Unhealthy blockchain makes overall status Unhealthy
@@ -517,9 +525,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_blockchain_handler_not_found() {
-        let db = Arc::new(MockDatabaseClient::new());
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(db, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
 
         let result = retry_blockchain_handler(State(state), Path("nonexistent".to_string())).await;
         assert!(matches!(result, Err(ItemError::NotFound(_))));

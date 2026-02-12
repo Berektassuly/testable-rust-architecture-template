@@ -2,4 +2,4 @@
 
 pub mod mocks;
 
-pub use mocks::{MockBlockchainClient, MockConfig, MockDatabaseClient};
+pub use mocks::{MockBlockchainClient, MockConfig, MockProvider, mock_repos};

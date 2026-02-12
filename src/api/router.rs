@@ -270,120 +270,15 @@ mod tests {
     mod test_utils {
         use std::sync::Arc;
 
-        use async_trait::async_trait;
-        use chrono::{DateTime, Utc};
-
         use crate::app::AppState;
-        use crate::domain::{
-            BlockchainClient, BlockchainError, BlockchainStatus, CreateItemRequest, DatabaseClient,
-            HealthCheckError, Item, ItemError, OutboxStatus, PaginatedResponse, SolanaOutboxEntry,
-            SolanaOutboxPayload,
-        };
-
-        #[derive(Clone)]
-        pub struct MockDatabaseClient;
-
-        #[async_trait]
-        impl DatabaseClient for MockDatabaseClient {
-            async fn health_check(&self) -> Result<(), HealthCheckError> {
-                Ok(())
-            }
-
-            async fn get_item(&self, _id: &str) -> Result<Option<Item>, ItemError> {
-                Ok(None)
-            }
-
-            async fn create_item(&self, _data: &CreateItemRequest) -> Result<Item, ItemError> {
-                unimplemented!()
-            }
-
-            async fn list_items(
-                &self,
-                _limit: i64,
-                _cursor: Option<&str>,
-            ) -> Result<PaginatedResponse<Item>, ItemError> {
-                unimplemented!()
-            }
-
-            async fn update_blockchain_status(
-                &self,
-                _id: &str,
-                _status: BlockchainStatus,
-                _signature: Option<&str>,
-                _error: Option<&str>,
-                _next_retry_at: Option<DateTime<Utc>>,
-            ) -> Result<(), ItemError> {
-                Ok(())
-            }
-
-            async fn claim_pending_solana_outbox(
-                &self,
-                _limit: i64,
-            ) -> Result<Vec<SolanaOutboxEntry>, ItemError> {
-                Ok(vec![])
-            }
-
-            async fn complete_solana_outbox(
-                &self,
-                _outbox_id: &str,
-                _item_id: &str,
-                _signature: &str,
-            ) -> Result<(), ItemError> {
-                Ok(())
-            }
-
-            async fn fail_solana_outbox(
-                &self,
-                _outbox_id: &str,
-                _item_id: &str,
-                _retry_count: i32,
-                _outbox_status: OutboxStatus,
-                _item_status: BlockchainStatus,
-                _error: &str,
-                _next_retry_at: Option<DateTime<Utc>>,
-            ) -> Result<(), ItemError> {
-                Ok(())
-            }
-
-            async fn enqueue_solana_outbox_for_item(
-                &self,
-                _item_id: &str,
-                _payload: &SolanaOutboxPayload,
-            ) -> Result<Item, ItemError> {
-                Ok(Item::default())
-            }
-
-            async fn get_pending_blockchain_items(
-                &self,
-                _limit: i64,
-            ) -> Result<Vec<Item>, ItemError> {
-                Ok(vec![])
-            }
-
-            async fn increment_retry_count(&self, _id: &str) -> Result<i32, ItemError> {
-                Ok(0)
-            }
-        }
-
-        #[derive(Clone)]
-        pub struct MockBlockchainClient;
-
-        #[async_trait]
-        impl BlockchainClient for MockBlockchainClient {
-            async fn health_check(&self) -> Result<(), HealthCheckError> {
-                Ok(())
-            }
-
-            async fn submit_transaction(&self, _hash: &str) -> Result<String, BlockchainError> {
-                Ok("tx".into())
-            }
-        }
+        use crate::test_utils::{MockBlockchainClient, MockProvider, mock_repos};
 
         impl AppState {
             pub fn new_for_test() -> Arc<Self> {
-                let db = Arc::new(MockDatabaseClient);
-                let bc = Arc::new(MockBlockchainClient);
-                Arc::new(AppState::new(db, bc))
+                let mock = Arc::new(MockProvider::new());
+                let (item_repo, outbox_repo) = mock_repos(&mock);
+                let bc = Arc::new(MockBlockchainClient::new());
+                Arc::new(AppState::new(item_repo, outbox_repo, bc))
             }
         }
     }

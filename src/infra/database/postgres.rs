@@ -9,9 +9,9 @@ use thiserror::Error;
 use tracing::{info, instrument};
 
 use crate::domain::{
-    BlockchainStatus, CreateItemRequest, DatabaseClient, HealthCheckError, Item, ItemError,
-    ItemMetadata, OutboxStatus, PaginatedResponse, SolanaOutboxEntry, SolanaOutboxPayload,
-    build_solana_outbox_payload_from_request,
+    BlockchainStatus, CreateItemRequest, HealthCheckError, Item, ItemError, ItemMetadata,
+    ItemRepository, OutboxRepository, OutboxStatus, PaginatedResponse, SolanaOutboxEntry,
+    SolanaOutboxPayload, build_solana_outbox_payload_from_request,
 };
 
 /// Error for Postgres client construction and migrations (used by main only).
@@ -146,7 +146,7 @@ impl PostgresClient {
 }
 
 #[async_trait]
-impl DatabaseClient for PostgresClient {
+impl ItemRepository for PostgresClient {
     #[instrument(skip(self))]
     async fn health_check(&self) -> Result<(), HealthCheckError> {
         sqlx::query("SELECT 1")
@@ -374,6 +374,124 @@ impl DatabaseClient for PostgresClient {
         Ok(())
     }
 
+    #[instrument(skip(self, payload))]
+    async fn enqueue_solana_outbox_for_item(
+        &self,
+        item_id: &str,
+        payload: &SolanaOutboxPayload,
+    ) -> Result<Item, ItemError> {
+        let now = Utc::now();
+        let outbox_id = uuid::Uuid::now_v7();
+        let mut tx = self.pool.begin().await.map_err(map_sqlx_to_item_error)?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO solana_outbox (id, aggregate_id, payload, status, created_at, retry_count)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(outbox_id)
+        .bind(item_id)
+        .bind(Json(payload.clone()))
+        .bind(OutboxStatus::Pending.as_str())
+        .bind(now)
+        .bind(0i32)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_to_item_error)?;
+
+        let row = sqlx::query(
+            r#"
+            UPDATE items
+            SET blockchain_status = $1,
+                blockchain_last_error = NULL,
+                blockchain_next_retry_at = NULL,
+                blockchain_retry_count = 0,
+                updated_at = $2
+            WHERE id = $3
+            RETURNING id, hash, name, description, content, metadata,
+                      blockchain_status, blockchain_signature, blockchain_retry_count,
+                      blockchain_last_error, blockchain_next_retry_at,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(BlockchainStatus::PendingSubmission.as_str())
+        .bind(now)
+        .bind(item_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx_to_item_error)?;
+
+        tx.commit().await.map_err(map_sqlx_to_item_error)?;
+
+        Self::row_to_item(&row)
+    }
+
+    #[instrument(skip(self))]
+    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, ItemError> {
+        let now = Utc::now();
+        let rows = sqlx::query(
+            r#"
+            WITH candidate AS (
+                SELECT id
+                FROM items
+                WHERE blockchain_status = 'pending_submission'
+                  AND (blockchain_next_retry_at IS NULL OR blockchain_next_retry_at <= $1)
+                  AND blockchain_retry_count < 10
+                ORDER BY blockchain_next_retry_at ASC NULLS FIRST, created_at ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE items
+            SET updated_at = $1
+            FROM candidate
+            WHERE items.id = candidate.id
+            RETURNING items.id, items.hash, items.name, items.description, items.content, items.metadata,
+                      items.blockchain_status, items.blockchain_signature, items.blockchain_retry_count,
+                      items.blockchain_last_error, items.blockchain_next_retry_at,
+                      items.created_at, items.updated_at
+            "#,
+        )
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx_to_item_error)?;
+
+        rows.iter().map(Self::row_to_item).collect()
+    }
+
+    #[instrument(skip(self))]
+    async fn increment_retry_count(&self, id: &str) -> Result<i32, ItemError> {
+        let row = sqlx::query(
+            r#"
+            UPDATE items 
+            SET blockchain_retry_count = blockchain_retry_count + 1,
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING blockchain_retry_count
+            "#,
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx_to_item_error)?;
+
+        Ok(row.get("blockchain_retry_count"))
+    }
+}
+
+#[async_trait]
+impl OutboxRepository for PostgresClient {
+    #[instrument(skip(self))]
+    async fn health_check(&self) -> Result<(), HealthCheckError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(|_| HealthCheckError::DatabaseUnavailable)?;
+        Ok(())
+    }
+
     #[instrument(skip(self))]
     async fn claim_pending_solana_outbox(
         &self,
@@ -508,112 +626,6 @@ impl DatabaseClient for PostgresClient {
         tx.commit().await.map_err(map_sqlx_to_item_error)?;
 
         Ok(())
-    }
-
-    #[instrument(skip(self, payload))]
-    async fn enqueue_solana_outbox_for_item(
-        &self,
-        item_id: &str,
-        payload: &SolanaOutboxPayload,
-    ) -> Result<Item, ItemError> {
-        let now = Utc::now();
-        let outbox_id = uuid::Uuid::now_v7();
-        let mut tx = self.pool.begin().await.map_err(map_sqlx_to_item_error)?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO solana_outbox (id, aggregate_id, payload, status, created_at, retry_count)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            "#,
-        )
-        .bind(outbox_id)
-        .bind(item_id)
-        .bind(Json(payload.clone()))
-        .bind(OutboxStatus::Pending.as_str())
-        .bind(now)
-        .bind(0i32)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sqlx_to_item_error)?;
-
-        let row = sqlx::query(
-            r#"
-            UPDATE items
-            SET blockchain_status = $1,
-                blockchain_last_error = NULL,
-                blockchain_next_retry_at = NULL,
-                blockchain_retry_count = 0,
-                updated_at = $2
-            WHERE id = $3
-            RETURNING id, hash, name, description, content, metadata,
-                      blockchain_status, blockchain_signature, blockchain_retry_count,
-                      blockchain_last_error, blockchain_next_retry_at,
-                      created_at, updated_at
-            "#,
-        )
-        .bind(BlockchainStatus::PendingSubmission.as_str())
-        .bind(now)
-        .bind(item_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_sqlx_to_item_error)?;
-
-        tx.commit().await.map_err(map_sqlx_to_item_error)?;
-
-        Self::row_to_item(&row)
-    }
-
-    #[instrument(skip(self))]
-    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, ItemError> {
-        let now = Utc::now();
-        let rows = sqlx::query(
-            r#"
-            WITH candidate AS (
-                SELECT id
-                FROM items
-                WHERE blockchain_status = 'pending_submission'
-                  AND (blockchain_next_retry_at IS NULL OR blockchain_next_retry_at <= $1)
-                  AND blockchain_retry_count < 10
-                ORDER BY blockchain_next_retry_at ASC NULLS FIRST, created_at ASC
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED
-            )
-            UPDATE items
-            SET updated_at = $1
-            FROM candidate
-            WHERE items.id = candidate.id
-            RETURNING items.id, items.hash, items.name, items.description, items.content, items.metadata,
-                      items.blockchain_status, items.blockchain_signature, items.blockchain_retry_count,
-                      items.blockchain_last_error, items.blockchain_next_retry_at,
-                      items.created_at, items.updated_at
-            "#,
-        )
-        .bind(now)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx_to_item_error)?;
-
-        rows.iter().map(Self::row_to_item).collect()
-    }
-
-    #[instrument(skip(self))]
-    async fn increment_retry_count(&self, id: &str) -> Result<i32, ItemError> {
-        let row = sqlx::query(
-            r#"
-            UPDATE items 
-            SET blockchain_retry_count = blockchain_retry_count + 1,
-                updated_at = NOW()
-            WHERE id = $1
-            RETURNING blockchain_retry_count
-            "#,
-        )
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(map_sqlx_to_item_error)?;
-
-        Ok(row.get("blockchain_retry_count"))
     }
 }
 

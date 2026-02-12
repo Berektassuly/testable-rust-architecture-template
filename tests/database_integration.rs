@@ -7,7 +7,8 @@ use testcontainers::{GenericImage, ImageExt, runners::AsyncRunner};
 
 use std::collections::HashMap;
 use testable_rust_architecture_template::domain::{
-    BlockchainStatus, CreateItemRequest, DatabaseClient, ItemMetadataRequest, OutboxStatus,
+    BlockchainStatus, CreateItemRequest, ItemMetadataRequest, ItemRepository, OutboxRepository,
+    OutboxStatus,
 };
 use testable_rust_architecture_template::infra::{PostgresClient, PostgresConfig};
 
@@ -285,7 +286,7 @@ async fn test_increment_retry_count() {
 async fn test_health_check() {
     let (client, _container) = setup_postgres().await;
 
-    let result = client.health_check().await;
+    let result = ItemRepository::health_check(&client).await;
     assert!(result.is_ok());
 }
 

@@ -9,9 +9,9 @@ use super::types::{
 };
 use chrono::{DateTime, Utc};
 
-/// Database client trait for persistence operations
+/// Item repository for domain entity persistence (CRUD and blockchain status).
 #[async_trait]
-pub trait DatabaseClient: Send + Sync {
+pub trait ItemRepository: Send + Sync {
     /// Check database connectivity
     async fn health_check(&self) -> Result<(), HealthCheckError>;
 
@@ -54,6 +54,26 @@ pub trait DatabaseClient: Send + Sync {
         next_retry_at: Option<DateTime<Utc>>,
     ) -> Result<(), ItemError>;
 
+    /// Enqueue a new Solana outbox entry for an existing item
+    async fn enqueue_solana_outbox_for_item(
+        &self,
+        item_id: &str,
+        payload: &SolanaOutboxPayload,
+    ) -> Result<Item, ItemError>;
+
+    /// Get items pending blockchain submission
+    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, ItemError>;
+
+    /// Increment retry count for an item
+    async fn increment_retry_count(&self, id: &str) -> Result<i32, ItemError>;
+}
+
+/// Outbox repository for worker queue processing (claim, complete, fail).
+#[async_trait]
+pub trait OutboxRepository: Send + Sync {
+    /// Check database connectivity
+    async fn health_check(&self) -> Result<(), HealthCheckError>;
+
     /// Claim pending Solana outbox entries for processing
     async fn claim_pending_solana_outbox(
         &self,
@@ -79,19 +99,6 @@ pub trait DatabaseClient: Send + Sync {
         error: &str,
         next_retry_at: Option<DateTime<Utc>>,
     ) -> Result<(), ItemError>;
-
-    /// Enqueue a new Solana outbox entry for an existing item
-    async fn enqueue_solana_outbox_for_item(
-        &self,
-        item_id: &str,
-        payload: &SolanaOutboxPayload,
-    ) -> Result<Item, ItemError>;
-
-    /// Get items pending blockchain submission
-    async fn get_pending_blockchain_items(&self, limit: i64) -> Result<Vec<Item>, ItemError>;
-
-    /// Increment retry count for an item
-    async fn increment_retry_count(&self, id: &str) -> Result<i32, ItemError>;
 }
 
 /// Blockchain client trait for chain operations
@@ -143,10 +150,10 @@ mod tests {
     use super::*;
 
     // Minimal implementation for testing default methods
-    struct MinimalDatabaseClient;
+    struct MinimalItemRepository;
 
     #[async_trait]
-    impl DatabaseClient for MinimalDatabaseClient {
+    impl ItemRepository for MinimalItemRepository {
         async fn health_check(&self) -> Result<(), HealthCheckError> {
             Ok(())
         }
@@ -178,6 +185,31 @@ mod tests {
             Ok(())
         }
 
+        async fn enqueue_solana_outbox_for_item(
+            &self,
+            _item_id: &str,
+            _payload: &SolanaOutboxPayload,
+        ) -> Result<Item, ItemError> {
+            Ok(Item::default())
+        }
+
+        async fn get_pending_blockchain_items(&self, _limit: i64) -> Result<Vec<Item>, ItemError> {
+            Ok(vec![])
+        }
+
+        async fn increment_retry_count(&self, _id: &str) -> Result<i32, ItemError> {
+            Ok(1)
+        }
+    }
+
+    struct MinimalOutboxRepository;
+
+    #[async_trait]
+    impl OutboxRepository for MinimalOutboxRepository {
+        async fn health_check(&self) -> Result<(), HealthCheckError> {
+            Ok(())
+        }
+
         async fn claim_pending_solana_outbox(
             &self,
             _limit: i64,
@@ -206,22 +238,6 @@ mod tests {
         ) -> Result<(), ItemError> {
             Ok(())
         }
-
-        async fn enqueue_solana_outbox_for_item(
-            &self,
-            _item_id: &str,
-            _payload: &SolanaOutboxPayload,
-        ) -> Result<Item, ItemError> {
-            Ok(Item::default())
-        }
-
-        async fn get_pending_blockchain_items(&self, _limit: i64) -> Result<Vec<Item>, ItemError> {
-            Ok(vec![])
-        }
-
-        async fn increment_retry_count(&self, _id: &str) -> Result<i32, ItemError> {
-            Ok(1)
-        }
     }
 
     struct MinimalBlockchainClient;
@@ -238,8 +254,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_database_client_update_item_not_supported() {
-        let client = MinimalDatabaseClient;
+    async fn test_item_repository_update_item_not_supported() {
+        let repo = MinimalItemRepository;
         let request = CreateItemRequest {
             name: "test".to_string(),
             description: None,
@@ -247,14 +263,14 @@ mod tests {
             metadata: None,
         };
 
-        let result = client.update_item("id", &request).await;
+        let result = repo.update_item("id", &request).await;
         assert!(matches!(result, Err(ItemError::InvalidState(_))));
     }
 
     #[tokio::test]
-    async fn test_database_client_delete_item_not_supported() {
-        let client = MinimalDatabaseClient;
-        let result = client.delete_item("id").await;
+    async fn test_item_repository_delete_item_not_supported() {
+        let repo = MinimalItemRepository;
+        let result = repo.delete_item("id").await;
         assert!(matches!(result, Err(ItemError::InvalidState(_))));
     }
 
