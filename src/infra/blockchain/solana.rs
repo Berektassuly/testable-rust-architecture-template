@@ -22,6 +22,7 @@ use std::str::FromStr;
 use crate::domain::{BlockchainClient, BlockchainError};
 
 /// Returns true if the error indicates the blockhash has expired or is invalid on-chain.
+#[cfg(feature = "real-blockchain")]
 fn is_blockhash_expired(e: &BlockchainError) -> bool {
     let msg = match e {
         BlockchainError::SubmissionFailed(s) => s.as_str(),
@@ -363,13 +364,13 @@ impl BlockchainClient for RpcBlockchainClient {
                     .map_err(|e| {
                         if is_blockhash_expired(&e) {
                             BlockchainError::BlockhashExpired
-                        } else if existing_blockhash.is_none() {
+                        } else {
+                            // Sticky blockhash: always include blockhash on any failure
+                            // (Timeout, NetworkError, etc.) so caller can persist for retry
                             BlockchainError::SubmissionFailedWithBlockhash {
                                 message: e.to_string(),
-                                blockhash_used: blockhash,
+                                blockhash_used: blockhash.clone(),
                             }
-                        } else {
-                            e
                         }
                     })?;
             info!(signature = %signature, "Transaction sent");

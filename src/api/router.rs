@@ -1,5 +1,6 @@
 //! HTTP routing configuration with rate limiting and OpenAPI documentation.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,11 +14,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use governor::{
-    Quota, RateLimiter,
-    clock::DefaultClock,
-    state::{InMemoryState, NotKeyed},
-};
+use governor::{Quota, RateLimiter};
 use tower::ServiceBuilder;
 use tower_http::{
     timeout::TimeoutLayer,
@@ -80,10 +77,18 @@ impl RateLimitConfig {
     }
 }
 
-/// Shared rate limiter state
+/// Shared rate limiter state (keyed by client IP to prevent global DoS)
 pub struct RateLimitState {
-    items_limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
-    health_limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
+    items_limiter: governor::RateLimiter<
+        IpAddr,
+        governor::state::keyed::DashMapStateStore<IpAddr>,
+        governor::clock::DefaultClock,
+    >,
+    health_limiter: governor::RateLimiter<
+        IpAddr,
+        governor::state::keyed::DashMapStateStore<IpAddr>,
+        governor::clock::DefaultClock,
+    >,
     config: RateLimitConfig,
 }
 
@@ -95,20 +100,50 @@ impl RateLimitState {
             .allow_burst(NonZeroU32::new(config.health_burst).unwrap());
 
         Self {
-            items_limiter: RateLimiter::direct(items_quota),
-            health_limiter: RateLimiter::direct(health_quota),
+            items_limiter: RateLimiter::dashmap(items_quota),
+            health_limiter: RateLimiter::dashmap(health_quota),
             config,
         }
     }
 }
 
-/// Rate limit middleware for items endpoints
+/// Extract client IP from request (X-Forwarded-For, X-Real-IP, or ConnectInfo).
+/// Falls back to 0.0.0.0 when unknown to avoid blocking; unknown clients share one bucket.
+fn client_ip_from_request<B>(request: &Request<B>) -> IpAddr {
+    // Prefer proxy headers (client is first in X-Forwarded-For)
+    if let Some(forwarded) = request.headers().get("x-forwarded-for") {
+        if let Ok(s) = forwarded.to_str() {
+            if let Some(first) = s.split(',').next() {
+                let trimmed = first.trim();
+                if let Ok(ip) = trimmed.parse::<IpAddr>() {
+                    return ip;
+                }
+            }
+        }
+    }
+    if let Some(real_ip) = request.headers().get("x-real-ip") {
+        if let Ok(s) = real_ip.to_str() {
+            if let Ok(ip) = s.trim().parse::<IpAddr>() {
+                return ip;
+            }
+        }
+    }
+    // ConnectInfo may inject SocketAddr when using into_make_service_with_connect_info
+    if let Some(addr) = request.extensions().get::<SocketAddr>() {
+        return addr.ip();
+    }
+    // Fallback: unknown clients share one bucket (prevents total global DoS)
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+}
+
+/// Rate limit middleware for items endpoints (per-IP to prevent global DoS)
 async fn rate_limit_items_middleware(
     State(rate_limit): State<Arc<RateLimitState>>,
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
-    match rate_limit.items_limiter.check() {
+    let client_ip = client_ip_from_request(&request);
+    match rate_limit.items_limiter.check_key(&client_ip) {
         Ok(_) => {
             let mut response = next.run(request).await;
             // Add rate limit headers
@@ -146,13 +181,14 @@ async fn rate_limit_items_middleware(
     }
 }
 
-/// Rate limit middleware for health endpoints
+/// Rate limit middleware for health endpoints (per-IP to prevent global DoS)
 async fn rate_limit_health_middleware(
     State(rate_limit): State<Arc<RateLimitState>>,
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
-    match rate_limit.health_limiter.check() {
+    let client_ip = client_ip_from_request(&request);
+    match rate_limit.health_limiter.check_key(&client_ip) {
         Ok(_) => next.run(request).await,
         Err(not_until) => {
             let wait_time = not_until.wait_time_from(governor::clock::Clock::now(
@@ -544,6 +580,52 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        /// Verifies per-IP rate limiting: one IP exhausting limit does not block another.
+        #[tokio::test]
+        async fn test_rate_limit_per_ip_prevents_global_dos() {
+            let config = RateLimitConfig {
+                general_rps: 1,
+                general_burst: 1,
+                ..Default::default()
+            };
+
+            let state = Arc::new(RateLimitState::new(config));
+
+            let app =
+                Router::new()
+                    .route("/", get(dummy_handler))
+                    .layer(middleware::from_fn_with_state(
+                        state,
+                        rate_limit_items_middleware,
+                    ));
+
+            // Exhaust limit for IP 192.168.1.1
+            let req1 = Request::builder()
+                .uri("/")
+                .header("X-Forwarded-For", "192.168.1.1")
+                .body(Body::empty())
+                .unwrap();
+            app.clone().oneshot(req1).await.unwrap();
+
+            // Second request from same IP should be blocked
+            let req2 = Request::builder()
+                .uri("/")
+                .header("X-Forwarded-For", "192.168.1.1")
+                .body(Body::empty())
+                .unwrap();
+            let res2 = app.clone().oneshot(req2).await.unwrap();
+            assert_eq!(res2.status(), StatusCode::TOO_MANY_REQUESTS);
+
+            // Different IP should still be allowed
+            let req3 = Request::builder()
+                .uri("/")
+                .header("X-Forwarded-For", "10.0.0.1")
+                .body(Body::empty())
+                .unwrap();
+            let res3 = app.oneshot(req3).await.unwrap();
+            assert_eq!(res3.status(), StatusCode::OK);
         }
 
         #[tokio::test]

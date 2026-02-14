@@ -507,14 +507,21 @@ impl OutboxRepository for PostgresClient {
             WITH candidate AS (
                 SELECT id
                 FROM solana_outbox
-                WHERE status = 'pending'
+                WHERE (
+                    status = 'pending'
+                    OR (
+                        status = 'processing'
+                        AND updated_at < NOW() - INTERVAL '5 minutes'
+                    )
+                )
                   AND (next_retry_at IS NULL OR next_retry_at <= $1)
                 ORDER BY created_at ASC
                 LIMIT $2
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE solana_outbox o
-            SET status = 'processing'
+            SET status = 'processing',
+                updated_at = NOW()
             FROM candidate
             WHERE o.id = candidate.id
             RETURNING o.id, o.aggregate_id, o.payload, o.status, o.retry_count, o.attempt_blockhash, o.created_at
@@ -542,7 +549,8 @@ impl OutboxRepository for PostgresClient {
         sqlx::query(
             r#"
             UPDATE solana_outbox
-            SET status = $1
+            SET status = $1,
+                updated_at = NOW()
             WHERE id = $2
             "#,
         )
@@ -603,7 +611,8 @@ impl OutboxRepository for PostgresClient {
                 SET status = $1,
                     retry_count = $2,
                     next_retry_at = $3,
-                    attempt_blockhash = $4
+                    attempt_blockhash = $4,
+                    updated_at = NOW()
                 WHERE id = $5
                 "#,
             )
@@ -621,7 +630,8 @@ impl OutboxRepository for PostgresClient {
                 UPDATE solana_outbox
                 SET status = $1,
                     retry_count = $2,
-                    next_retry_at = $3
+                    next_retry_at = $3,
+                    updated_at = NOW()
                 WHERE id = $4
                 "#,
             )

@@ -211,12 +211,12 @@ impl AppService {
                     )
                 };
 
-                // Sticky blockhash: persist or clear for next retry
+                // Sticky blockhash: persist or clear for next retry.
+                // Always persist blockhash when returned (Timeout, NetworkError, etc.)
+                // so the next retry uses the same blockhash and avoids double-spending.
                 let attempt_blockhash = match &e {
                     BlockchainError::BlockhashExpired => Some(None),
-                    BlockchainError::SubmissionFailedWithBlockhash { blockhash_used, .. }
-                        if entry.attempt_blockhash.is_none() =>
-                    {
+                    BlockchainError::SubmissionFailedWithBlockhash { blockhash_used, .. } => {
                         Some(Some(blockhash_used.as_str()))
                     }
                     _ => None,
