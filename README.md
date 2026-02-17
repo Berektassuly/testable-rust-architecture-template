@@ -241,10 +241,10 @@ This design means every layer -- handlers, services, and error mapping -- can be
 cargo test
 ```
 
-For integration tests that use testcontainers (requires Docker):
+Database integration tests (`tests/database_integration.rs`) use **testcontainers** and require Docker. They are **ignored by default** so `cargo test` passes without Docker. To run them when Docker is available:
 
 ```bash
-cargo test --test '*'
+cargo test --test database_integration -- --ignored
 ```
 
 ---

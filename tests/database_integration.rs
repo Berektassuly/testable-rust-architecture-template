@@ -1,7 +1,9 @@
 //! Database integration tests using testcontainers.
 //!
 //! These tests require Docker to be running and use testcontainers
-//! to spin up a real PostgreSQL instance.
+//! to spin up a real PostgreSQL instance. They are ignored by default
+//! so `cargo test` passes without Docker. Run with:
+//! `cargo test --test database_integration -- --ignored`
 
 use testcontainers::{GenericImage, ImageExt, runners::AsyncRunner};
 
@@ -52,6 +54,7 @@ async fn setup_postgres() -> (PostgresClient, testcontainers::ContainerAsync<Gen
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn test_create_and_get_item() {
     let (client, _container) = setup_postgres().await;
 
@@ -79,6 +82,7 @@ async fn test_create_and_get_item() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn test_create_item_with_metadata() {
     let (client, _container) = setup_postgres().await;
 
@@ -110,6 +114,7 @@ async fn test_create_item_with_metadata() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn test_list_items_pagination() {
     let (client, _container) = setup_postgres().await;
 
@@ -163,6 +168,7 @@ async fn test_list_items_pagination() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn test_blockchain_status_updates() {
     let (client, _container) = setup_postgres().await;
 
@@ -227,6 +233,7 @@ async fn test_blockchain_status_updates() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn test_claim_pending_solana_outbox() {
     let (client, _container) = setup_postgres().await;
 
@@ -250,6 +257,7 @@ async fn test_claim_pending_solana_outbox() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn test_increment_retry_count() {
     let (client, _container) = setup_postgres().await;
 
@@ -283,6 +291,7 @@ async fn test_increment_retry_count() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn test_health_check() {
     let (client, _container) = setup_postgres().await;
 
@@ -291,6 +300,7 @@ async fn test_health_check() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn test_get_nonexistent_item() {
     let (client, _container) = setup_postgres().await;
 
