@@ -227,8 +227,8 @@ impl AppService {
                     BlockchainError::SubmissionFailedWithBlockhash { blockhash_used, .. } => {
                         Some(Some(blockhash_used.as_str()))
                     }
-                    BlockchainError::Timeout { ref blockhash, .. }
-                    | BlockchainError::NetworkError { ref blockhash, .. } => {
+                    BlockchainError::Timeout { blockhash, .. }
+                    | BlockchainError::NetworkError { blockhash, .. } => {
                         Some(Some(blockhash.as_str()))
                     }
                     BlockchainError::SubmissionFailed(_) | BlockchainError::InsufficientFunds => {

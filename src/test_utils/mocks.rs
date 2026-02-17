@@ -32,6 +32,8 @@ impl MockConfig {
         Self {
             should_fail: true,
             error_message: Some(message.into()),
+            fail_with_timeout: false,
+            timeout_blockhash: None,
         }
     }
 }
