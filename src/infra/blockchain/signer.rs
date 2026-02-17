@@ -126,9 +126,7 @@ impl AwsKmsSigner {
         let spki_blob = response
             .public_key
             .ok_or_else(|| {
-                BlockchainError::SubmissionFailed(
-                    "KMS returned no public key blob".to_string(),
-                )
+                BlockchainError::SubmissionFailed("KMS returned no public key blob".to_string())
             })?
             .into_inner();
 
@@ -195,9 +193,7 @@ impl TransactionSigner for AwsKmsSigner {
             .signing_algorithm(SigningAlgorithmSpec::Ed25519)
             .send()
             .await
-            .map_err(|e| {
-                BlockchainError::SubmissionFailed(format!("KMS Sign failed: {e}"))
-            })?;
+            .map_err(|e| BlockchainError::SubmissionFailed(format!("KMS Sign failed: {e}")))?;
 
         let signature_blob = response.signature.ok_or_else(|| {
             BlockchainError::SubmissionFailed("KMS returned no signature blob".to_string())
