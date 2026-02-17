@@ -150,6 +150,8 @@ impl AppService {
             .await?;
         let count = pending_entries.len();
 
+        metrics::gauge!("outbox_pending_items_count").set(count as f64);
+
         if count == 0 {
             return Ok(0);
         }
@@ -192,6 +194,7 @@ impl AppService {
                     .await?;
             }
             Err(e) => {
+                metrics::counter!("blockchain_submission_retry_total").increment(1);
                 warn!(
                     outbox_id = %entry.id,
                     item_id = %entry.aggregate_id,

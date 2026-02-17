@@ -10,6 +10,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tracing::{debug, info, instrument, warn};
 
 #[cfg(feature = "real-blockchain")]
@@ -21,6 +22,18 @@ use solana_sdk::{
 use std::str::FromStr;
 
 use crate::domain::{BlockchainClient, BlockchainError, TransactionSigner};
+
+/// Map BlockchainError to a stable label for metrics.
+fn blockchain_error_type(e: &BlockchainError) -> &'static str {
+    match e {
+        BlockchainError::SubmissionFailed(_) => "submission_failed",
+        BlockchainError::SubmissionFailedWithBlockhash { .. } => "submission_failed_with_blockhash",
+        BlockchainError::BlockhashExpired => "blockhash_expired",
+        BlockchainError::NetworkError(_) => "network_error",
+        BlockchainError::InsufficientFunds => "insufficient_funds",
+        BlockchainError::Timeout(_) => "timeout",
+    }
+}
 
 /// Returns true if the error indicates the blockhash has expired or is invalid on-chain.
 #[cfg(feature = "real-blockchain")]
@@ -244,6 +257,7 @@ impl RpcBlockchainClient {
         let params_value = serde_json::to_value(params)
             .map_err(|e| BlockchainError::SubmissionFailed(format!("Serialization: {}", e)))?;
 
+        let start = Instant::now();
         let mut last_error = None;
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
@@ -255,18 +269,37 @@ impl RpcBlockchainClient {
                 .await
             {
                 Ok(result_value) => {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    metrics::histogram!(
+                        "solana_rpc_latency_seconds",
+                        "method" => method.to_string(),
+                    )
+                    .record(elapsed);
                     return serde_json::from_value(result_value).map_err(|e| {
                         BlockchainError::SubmissionFailed(format!("Deserialization: {}", e))
                     });
                 }
                 Err(e) => {
+                    metrics::counter!(
+                        "solana_rpc_errors_total",
+                        "method" => method.to_string(),
+                        "error_type" => blockchain_error_type(&e).to_string(),
+                    )
+                    .increment(1);
                     warn!(attempt = attempt, error = ?e, method = %method, "RPC call failed");
                     last_error = Some(e);
                 }
             }
         }
-        Err(last_error
-            .unwrap_or_else(|| BlockchainError::SubmissionFailed("Unknown error".to_string())))
+        let err = last_error
+            .unwrap_or_else(|| BlockchainError::SubmissionFailed("Unknown error".to_string()));
+        metrics::counter!(
+            "solana_rpc_errors_total",
+            "method" => method.to_string(),
+            "error_type" => blockchain_error_type(&err).to_string(),
+        )
+        .increment(1);
+        Err(err)
     }
 
     /// Build and serialize a memo transaction using solana-sdk for protocol-compliant
@@ -308,6 +341,13 @@ impl RpcBlockchainClient {
     }
 }
 
+/// Solana getBalance RPC result (result.value = balance in lamports, or null if account missing).
+#[derive(Debug, Deserialize)]
+struct GetBalanceResult {
+    #[serde(default)]
+    value: Option<u64>,
+}
+
 #[async_trait]
 impl BlockchainClient for RpcBlockchainClient {
     #[instrument(skip(self))]
@@ -316,6 +356,18 @@ impl BlockchainClient for RpcBlockchainClient {
             .rpc_call("getSlot", Vec::<()>::new())
             .await
             .map_err(|_| crate::domain::HealthCheckError::BlockchainUnavailable)?;
+
+        // CRITICAL: heartbeat on funds every time the liveness probe runs
+        let pubkey = self.signer.public_key();
+        let params = vec![pubkey];
+        if let Ok(balance_result) = self
+            .rpc_call::<_, GetBalanceResult>("getBalance", params)
+            .await
+        {
+            let lamports = balance_result.value.unwrap_or(0);
+            metrics::gauge!("solana_wallet_balance_lamports").set(lamports as f64);
+        }
+
         Ok(())
     }
 

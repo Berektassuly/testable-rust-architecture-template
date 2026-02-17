@@ -16,8 +16,10 @@ use testable_rust_architecture_template::api::{
 };
 use testable_rust_architecture_template::app::{AppState, WorkerConfig, spawn_worker};
 use testable_rust_architecture_template::domain::TransactionSigner;
-use testable_rust_architecture_template::infra::{AwsKmsSigner, LocalSigner, RpcBlockchainClient};
-use testable_rust_architecture_template::infra::{PostgresClient, PostgresConfig};
+use testable_rust_architecture_template::infra::{
+    AwsKmsSigner, LocalSigner, PostgresClient, PostgresConfig, RpcBlockchainClient,
+    init_metrics_handle,
+};
 
 /// Application configuration
 struct Config {
@@ -172,11 +174,13 @@ async fn main() -> Result<()> {
         Arc::clone(&db) as Arc<dyn testable_rust_architecture_template::domain::ItemRepository>;
     let outbox_repo =
         Arc::clone(&db) as Arc<dyn testable_rust_architecture_template::domain::OutboxRepository>;
-    let app_state = Arc::new(AppState::new(
+    let metrics_handle = init_metrics_handle();
+    let app_state = Arc::new(AppState::new_with_metrics(
         item_repo,
         outbox_repo,
         Arc::new(blockchain_client),
         config.api_auth_key,
+        metrics_handle,
     ));
 
     // Start background worker if enabled

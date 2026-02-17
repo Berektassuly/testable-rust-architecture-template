@@ -10,6 +10,7 @@ use axum::{
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::warn;
 
 use crate::app::AppState;
@@ -63,4 +64,36 @@ pub async fn auth_middleware(
     }
 
     next.run(request).await
+}
+
+/// HTTP metrics middleware: records request count and duration for Grafana.
+/// Labels: method, route, status for `http_requests_total`; method, route for `http_request_duration_seconds`.
+pub async fn metrics_middleware(
+    State(_state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    let method = request.method().as_str().to_string();
+    let route = request.uri().path().to_string();
+    let start = Instant::now();
+
+    let response = next.run(request).await;
+    let status = response.status().as_u16().to_string();
+    let elapsed_secs = start.elapsed().as_secs_f64();
+
+    metrics::counter!(
+        "http_requests_total",
+        "method" => method.clone(),
+        "route" => route.clone(),
+        "status" => status,
+    )
+    .increment(1);
+    metrics::histogram!(
+        "http_request_duration_seconds",
+        "method" => method,
+        "route" => route,
+    )
+    .record(elapsed_secs);
+
+    response
 }

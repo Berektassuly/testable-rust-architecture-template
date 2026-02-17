@@ -31,7 +31,7 @@ use super::handlers::{
     ApiDoc, create_item_handler, get_item_handler, health_check_handler, list_items_handler,
     liveness_handler, readiness_handler, retry_blockchain_handler,
 };
-use super::middleware::auth_middleware;
+use super::middleware::{auth_middleware, metrics_middleware};
 
 /// Rate limiter configuration
 #[derive(Debug, Clone)]
@@ -225,9 +225,32 @@ async fn rate_limit_health_middleware(
     }
 }
 
+/// Prometheus scrape endpoint: returns metrics in exposition format.
+async fn metrics_handler(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let handle = app_state
+        .metrics_handle
+        .as_ref()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    handle.run_upkeep();
+    let body = handle.render();
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    ))
+}
+
 /// Create router without rate limiting
 pub fn create_router(app_state: Arc<AppState>) -> Router {
     let middleware = ServiceBuilder::new()
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&app_state),
+            metrics_middleware,
+        ))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
@@ -255,6 +278,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/ready", get(readiness_handler));
 
     Router::new()
+        .route("/metrics", get(metrics_handler))
         .nest("/items", items_routes)
         .nest("/health", health_routes)
         .layer(middleware)
@@ -267,6 +291,10 @@ pub fn create_router_with_rate_limit(app_state: Arc<AppState>, config: RateLimit
     let rate_limit_state = Arc::new(RateLimitState::new(config));
 
     let middleware = ServiceBuilder::new()
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&app_state),
+            metrics_middleware,
+        ))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
@@ -302,6 +330,7 @@ pub fn create_router_with_rate_limit(app_state: Arc<AppState>, config: RateLimit
         ));
 
     Router::new()
+        .route("/metrics", get(metrics_handler))
         .nest("/items", items_routes)
         .nest("/health", health_routes)
         .layer(middleware)
