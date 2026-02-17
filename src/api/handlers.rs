@@ -138,7 +138,7 @@ pub async fn get_item_handler(
         .service
         .get_item(&id)
         .await?
-        .ok_or_else(|| ItemError::NotFound(id))?;
+        .ok_or(ItemError::NotFound(id))?;
     Ok(Json(item))
 }
 

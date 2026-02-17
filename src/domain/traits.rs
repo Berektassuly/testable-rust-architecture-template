@@ -81,6 +81,7 @@ pub trait ItemRepository: Send + Sync {
 
 /// Outbox repository for worker queue processing (claim, complete, fail).
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait OutboxRepository: Send + Sync {
     /// Check database connectivity
     async fn health_check(&self) -> Result<(), HealthCheckError>;
@@ -229,6 +230,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     struct MinimalOutboxRepository;
 
     #[async_trait]

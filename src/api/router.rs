@@ -127,22 +127,20 @@ fn client_ip_from_request<B>(request: &Request<B>, trust_proxy_headers: bool) ->
     }
     // Only use headers when explicitly configured to trust upstream proxies.
     if trust_proxy_headers {
-        if let Some(forwarded) = request.headers().get("x-forwarded-for") {
-            if let Ok(s) = forwarded.to_str() {
-                if let Some(first) = s.split(',').next() {
-                    let trimmed = first.trim();
-                    if let Ok(ip) = trimmed.parse::<IpAddr>() {
-                        return ip;
-                    }
-                }
+        if let Some(forwarded) = request.headers().get("x-forwarded-for")
+            && let Ok(s) = forwarded.to_str()
+            && let Some(first) = s.split(',').next()
+        {
+            let trimmed = first.trim();
+            if let Ok(ip) = trimmed.parse::<IpAddr>() {
+                return ip;
             }
         }
-        if let Some(real_ip) = request.headers().get("x-real-ip") {
-            if let Ok(s) = real_ip.to_str() {
-                if let Ok(ip) = s.trim().parse::<IpAddr>() {
-                    return ip;
-                }
-            }
+        if let Some(real_ip) = request.headers().get("x-real-ip")
+            && let Ok(s) = real_ip.to_str()
+            && let Ok(ip) = s.trim().parse::<IpAddr>()
+        {
+            return ip;
         }
     }
     // Fallback: unknown clients share one bucket (prevents total global DoS).
