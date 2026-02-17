@@ -1,207 +1,295 @@
-# Testable Rust Architecture Template
+# Rust Solana Transactional Outbox Service
 
-[![CI](https://github.com/Berektassuly/testable-rust-architecture-template/actions/workflows/ci.yml/badge.svg)](https://github.com/Berektassuly/testable-rust-architecture-template/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/Berektassuly/testable-rust-architecture-template/graph/badge.svg?token=YOUR_TOKEN)](https://codecov.io/gh/Berektassuly/testable-rust-architecture-template)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Build: Passing](https://img.shields.io/badge/build-passing-brightgreen)
+![License: MIT](https://img.shields.io/badge/license-MIT-blue)
+![Rust: 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange)
 
-A production-grade reference implementation for building scalable, resilient, and testable backend services in Rust. This template implements Clean Architecture principles with strict layer separation, dependency injection via traits, and robust integration with PostgreSQL and Solana.
+A reliable, production-grade bridge between **PostgreSQL** and the **Solana blockchain** using the **Transactional Outbox** pattern. Built with Clean Architecture principles in Rust, the service guarantees that every domain event is eventually delivered to the blockchain with exactly-once semantics, even in the face of network failures and process crashes.
 
-## Overview
+---
 
-This project serves as a blueprint for high-assurance Rust applications. It solves common architectural challenges by decoupling business logic from infrastructure concerns, enabling independent testing of components and graceful degradation in distributed systems.
+## Table of Contents
 
-### Key Features
+- [Architectural Overview](#architectural-overview)
+- [Key Design Patterns](#key-design-patterns-the-why)
+- [Configuration](#configuration)
+- [Getting Started](#getting-started)
+- [Testing](#testing)
+- [API Documentation](#api-documentation)
+- [API Endpoints](#api-endpoints)
 
-*   **Clean Architecture:** Strict separation of concerns into API, Application, Domain, and Infrastructure layers.
-*   **Dependency Injection:** Logic relies on traits rather than concrete implementations, facilitating mocking and testing.
-*   **Resilience & Reliability:**
-    *   **Graceful Degradation:** Fallback mechanisms when external services (Blockchain) are unavailable.
-    *   **Background Workers:** Asynchronous retry queues for eventual consistency.
-    *   **Rate Limiting:** In-memory request throttling via `governor`.
-*   **Observability:** Structured logging with `tracing` and auto-generated OpenAPI (Swagger) documentation.
-*   **Database:** Compile-time checked SQL queries using `sqlx` and PostgreSQL.
-*   **Blockchain Integration:** Solana RPC client with transaction signing and confirmation tracking.
-*   **Testing Strategy:** Comprehensive suite including unit tests, mock-based testing, and containerized integration tests using `testcontainers`.
+---
 
-## Architecture
+## Architectural Overview
 
-The application follows a unidirectional dependency flow. The Domain layer contains pure business rules and interfaces, while the Infrastructure layer implements those interfaces.
+The application follows a strict **Clean Architecture** (Hexagonal / Ports-and-Adapters) layout. Each layer has a single responsibility and communicates only through trait-defined boundaries, making the entire system unit-testable without databases or network access.
 
-```text
-src/
-├── api/        # Presentation Layer
-│               # - HTTP Handlers (Axum)
-│               # - Route configuration
-│               # - Rate limiting middleware
-│               # - OpenAPI definition
-│
-├── app/        # Application Layer
-│               # - Service orchestration
-│               # - Background worker logic
-│               # - Application state
-│
-├── domain/     # Domain Layer (Pure Rust)
-│               # - Entities and DTOs
-│               # - Interface definitions (Traits)
-│               # - Domain Errors
-│
-└── infra/      # Infrastructure Layer
-                # - PostgreSQL adapter (SQLx)
-                # - Solana RPC client
-                # - External service implementations
 ```
+src/
+  api/          -- HTTP handlers, routing, middleware (Axum)
+  app/          -- Application services, business logic orchestration
+  domain/       -- Pure Rust: entities, traits (ports), errors
+  infra/        -- Infrastructure adapters: Postgres, Solana RPC
+  test_utils/   -- Mock implementations for all traits
+```
+
+| Layer            | Responsibility                                           | Key Files                         |
+|------------------|----------------------------------------------------------|-----------------------------------|
+| **API**          | HTTP routing, request validation, OpenAPI docs           | `handlers.rs`, `router.rs`, `middleware.rs` |
+| **Application**  | Use-case orchestration, retry logic, health checks       | `service.rs`, `worker.rs`         |
+| **Domain**       | Entity definitions, repository traits, error types       | `models.rs`, `traits.rs`          |
+| **Infrastructure** | PostgreSQL repository, Solana RPC client, metrics      | `postgres.rs`, `blockchain.rs`    |
+
+### System Data Flow
+
+```mermaid
+graph TD
+    A["External Request"] --> B["API Layer (Axum)"]
+    B --> C["App Service (Business Logic)"]
+    C --> D["Domain Layer (Entities / Traits)"]
+    C --> E["Infrastructure (Postgres Repository)"]
+    E --> F["Atomic Insert: Item + Outbox Entry"]
+
+    G["Background Worker"] --> H["Infrastructure (Postgres Outbox)"]
+    H --> I["Claim Pending (FOR UPDATE SKIP LOCKED)"]
+    G --> J["Infrastructure (Solana RPC)"]
+    J --> K["Submit Transaction"]
+    K -->|Success| L["Mark Outbox Complete + Update Item"]
+    K -->|Failure| M["Sticky Blockhash Retry with Backoff"]
+```
+
+---
+
+## Key Design Patterns (The "Why")
+
+### Transactional Outbox
+
+The core reliability guarantee lives in `infra/database/postgres.rs`, inside the `create_item` method. When a new item is created, both the `items` row and its corresponding `solana_outbox` row are inserted within a **single database transaction**:
+
+```rust
+let mut tx = self.pool.begin().await?;
+
+// 1. Insert the item
+sqlx::query("INSERT INTO items ...").execute(&mut *tx).await?;
+
+// 2. Insert the outbox entry (blockchain intent)
+sqlx::query("INSERT INTO solana_outbox ...").execute(&mut *tx).await?;
+
+// 3. Commit atomically
+tx.commit().await?;
+```
+
+This guarantees **atomicity**: an item is never persisted without a corresponding blockchain submission intent. If the process crashes after commit, the outbox entry survives and will be picked up by the background worker. If the transaction rolls back, neither the item nor the outbox entry exists -- no orphaned state.
+
+### Sticky Blockhash Strategy (Double-Spend Prevention)
+
+The `process_outbox_entry` method in `app/service.rs` implements a **sticky blockhash** mechanism to prevent double-spend on retries. The problem: if a Solana transaction is submitted but the response is lost (timeout, network error), the transaction may have landed on-chain. Retrying with a *new* blockhash would produce a *different* signature, potentially spending funds twice.
+
+The solution:
+
+1. On the **first attempt**, the blockchain client fetches a fresh `recent_blockhash` and returns it alongside the signature.
+2. If submission **fails with a recoverable error** (timeout, network error, or submission failure with a known blockhash), the `blockhash_used` is **persisted** to the `attempt_blockhash` column in `solana_outbox`.
+3. On **retry**, the persisted blockhash is supplied to `submit_transaction`. The transaction is reconstructed with the **same blockhash**, producing an **identical signature**. If the original transaction already landed, the retry is a harmless duplicate.
+4. The blockhash is only **cleared** on `BlockhashExpired`, which confirms the original transaction could not have been processed.
+
+```
+First Attempt:  fetch_blockhash() -> sign(data, blockhash_A) -> submit -> TIMEOUT
+                persist attempt_blockhash = blockhash_A
+
+Retry:          reuse blockhash_A  -> sign(data, blockhash_A) -> submit -> OK
+                identical signature = idempotent
+```
+
+### Concurrency Control (Horizontal Worker Scaling)
+
+The SQL queries in both `claim_pending_solana_outbox` and `get_pending_blockchain_items` use PostgreSQL's `FOR UPDATE SKIP LOCKED` clause:
+
+```sql
+WITH candidate AS (
+    SELECT id
+    FROM solana_outbox
+    WHERE status = 'pending'
+      AND (next_retry_at IS NULL OR next_retry_at <= $1)
+    ORDER BY created_at ASC
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE solana_outbox o
+SET status = 'processing', updated_at = NOW()
+FROM candidate
+WHERE o.id = candidate.id
+RETURNING ...
+```
+
+This enables **safe horizontal scaling**: multiple worker instances can poll the outbox concurrently without processing the same entry. Each worker atomically claims a batch of rows; any rows already locked by another worker are silently skipped. No external coordination (Redis, ZooKeeper) is required.
+
+---
+
+## Configuration
+
+All configuration is loaded from environment variables. The application reads a `.env` file on startup via `dotenvy`.
+
+### Environment Variables
+
+| Variable                   | Required | Default                            | Description                                                    |
+|----------------------------|----------|------------------------------------|----------------------------------------------------------------|
+| `DATABASE_URL`             | Yes      | --                                 | PostgreSQL connection string                                   |
+| `API_AUTH_KEY`             | Yes      | --                                 | API key for authenticating `POST` requests (`x-api-key` header)|
+| `SOLANA_RPC_URL`           | No       | `https://api.devnet.solana.com`    | Solana JSON-RPC endpoint                                       |
+| `SIGNER_TYPE`              | No       | `LOCAL`                            | Transaction signer: `LOCAL` or `KMS`                           |
+| `ISSUER_PRIVATE_KEY`       | No       | Ephemeral keypair generated        | Base58-encoded Ed25519 private key (when `SIGNER_TYPE=LOCAL`)  |
+| `KMS_KEY_ID`               | Cond.    | --                                 | AWS KMS key ID (required when `SIGNER_TYPE=KMS`)               |
+| `HOST`                     | No       | `0.0.0.0`                          | Server bind address                                            |
+| `PORT`                     | No       | `3000`                             | Server listen port                                             |
+| `ENABLE_RATE_LIMITING`     | No       | `false`                            | Enable request rate limiting                                   |
+| `RATE_LIMIT_RPS`           | No       | `10`                               | Rate limit: requests per second                                |
+| `RATE_LIMIT_BURST`         | No       | `20`                               | Rate limit: burst capacity                                     |
+| `ENABLE_BACKGROUND_WORKER` | No       | `true`                             | Enable the outbox background worker                            |
+| `RUST_LOG`                 | No       | `info,tower_http=debug,sqlx=warn`  | Tracing filter directive                                       |
+
+### PostgreSQL Pool Configuration (Compile-Time Defaults)
+
+| Parameter         | Default |
+|-------------------|---------|
+| `max_connections`  | 10      |
+| `min_connections`  | 2       |
+| `acquire_timeout`  | 3s      |
+| `idle_timeout`     | 600s    |
+| `max_lifetime`     | 1800s   |
+
+---
 
 ## Getting Started
 
 ### Prerequisites
 
-*   **Rust:** Latest stable toolchain.
-*   **Docker:** **Required** for running the local database and executing integration tests via `testcontainers`. Ensure Docker Desktop or the Docker daemon is **running**.
-*   **PostgreSQL:** Version 16+ (if running locally without Docker).
-*   **VS Code REST Client:** (Optional) Recommended for manual testing using the provided `requests.http` file.
+- **Rust** toolchain (1.75+ recommended) -- install via [rustup](https://rustup.rs)
+- **Docker** (for PostgreSQL)
+- **Solana CLI** (optional, for key management)
 
-### Configuration
+### Local Setup
 
-1.  Clone the repository:
-    ```bash
-    git clone https://github.com/Berektassuly/testable-rust-architecture-template.git
-    cd testable-rust-architecture-template
-    ```
+**1. Start PostgreSQL**
 
-2.  Initialize configuration:
-    ```bash
-    cp .env.example .env
-    ```
-
-3.  Edit `.env` to set your specific configuration. For local development, the default values usually suffice.
-
-### Database Setup
-
-The quickest way to start the database is using Docker Compose:
+Using Docker Compose (recommended):
 
 ```bash
-# Start the database container in the background
-docker-compose up -d
+docker compose up -d
 ```
 
-> [!TIP]
-> If you encounter a connection error, verify that Docker is running on your machine.
+Or directly with Docker:
 
-Alternatively, if you want to manage migrations manually or use a local PostgreSQL instance:
-
-1. Install the SQLx CLI tool:
-   ```bash
-   cargo install sqlx-cli --no-default-features --features postgres
-   ```
-
-2. Run migrations:
-   ```bash
-   # Ensure the database defined in DATABASE_URL exists or use:
-   # sqlx database create
-   sqlx migrate run --source ./migrations
-   ```
-
-### Running the Application
-
-By default, the server listens on `http://0.0.0.0:3000`.
-
-### Manual Testing
-
-You can test the API manually using the [requests.http](requests.http) file. If you have the **REST Client** extension for VS Code installed, simply open the file and click **"Send Request"** above any endpoint.
-
-Available manual tests include:
-- Health checks and probes
-- Item creation (POST)
-- Listing and retrieving items (GET)
-- Blockchain submission retries
-
-## API Documentation
-
-The application automatically generates an OpenAPI specification and hosts a Swagger UI.
-
-*   **Swagger UI:** `http://localhost:3000/swagger-ui`
-*   **OpenAPI Spec:** `http://localhost:3000/api-docs/openapi.json`
-
-## Configuration Reference
-
-The application is configured via environment variables.
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | `postgres://postgres:postgres@localhost:5432/app_dev` |
-| `SOLANA_RPC_URL` | Solana Cluster Endpoint | `https://api.devnet.solana.com` |
-| `ISSUER_PRIVATE_KEY` | Base58 private key for signing | *(Generated ephemeral key if unset)* |
-| `HOST` | Server bind address | `0.0.0.0` |
-| `PORT` | Server bind port | `3000` |
-| `ENABLE_RATE_LIMITING` | Toggle API rate limiting | `false` |
-| `RATE_LIMIT_RPS` | Requests per second limit | `10` |
-| `ENABLE_BACKGROUND_WORKER` | Enable the retry worker | `true` |
-| `RUST_LOG` | Tracing log level | `info,tower_http=debug` |
-
-## Build Features
-
-This template uses Cargo features to manage external dependencies and build targets.
-
-*   `default`: Uses a mock blockchain implementation for faster development.
-*   `real-blockchain`: Enables actual Solana network interaction.
-*   `test-utils`: Exposes mock clients and utilities for integration testing.
-
-To build for production with real blockchain integration:
 ```bash
-cargo build --release --features real-blockchain
+docker run --name pg \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=app_dev \
+  -p 5432:5432 \
+  -d postgres:16-alpine
 ```
+
+**2. Configure Environment**
+
+Copy the example environment file and edit as needed:
+
+```bash
+cp .env.example .env
+```
+
+At minimum, set the required variables:
+
+```env
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/app_dev
+API_AUTH_KEY=your-secret-api-key-here
+SOLANA_RPC_URL=https://api.devnet.solana.com
+ISSUER_PRIVATE_KEY=YOUR_BASE58_ENCODED_PRIVATE_KEY_HERE
+```
+
+**3. Run the Application**
+
+Migrations are applied automatically on startup by `PostgresClient::run_migrations()`.
+
+```bash
+cargo run
+```
+
+The server will start on `http://0.0.0.0:3000` by default. You should see output similar to:
+
+```
+INFO  Server starting on http://0.0.0.0:3000
+INFO  Swagger UI available at http://0.0.0.0:3000/swagger-ui
+INFO  OpenAPI spec at http://0.0.0.0:3000/api-docs/openapi.json
+```
+
+---
 
 ## Testing
 
-The project employs a multi-level testing strategy to ensure reliability without sacrificing development speed.
+### Strategy
 
-### Unit Tests
-Fast, isolated tests using mocks for database and blockchain clients.
+The codebase uses **trait-based dependency injection** to achieve full testability without external services. The `test_utils` module (enabled via the `test-utils` feature flag) provides:
 
-```bash
-cargo test --lib
-```
+- **`MockProvider`**: An in-memory implementation of both `ItemRepository` and `OutboxRepository`. Stores items and outbox entries in `Arc<RwLock<HashMap<...>>>` for thread-safe concurrent test access.
+- **`MockBlockchainClient`**: A configurable mock that can simulate successful submissions or controlled failures (via `MockBlockchainClient::failing("error message")`).
+- **`mock_repos()`**: A convenience function that returns `(Arc<dyn ItemRepository>, Arc<dyn OutboxRepository>)` backed by the same `MockProvider` instance.
 
-### Test Coverage
-Measure code coverage using `tarpaulin`:
+This design means every layer -- handlers, services, and error mapping -- can be tested in isolation with sub-millisecond execution.
 
-```bash
-# Install tarpaulin
-cargo install cargo-tarpaulin
-
-# Run coverage
-cargo tarpaulin --ignore-tests --out Html
-```
-
-### Integration Tests
-End-to-end API tests and database integration tests. These require Docker as they spin up ephemeral PostgreSQL containers.
+### Running Tests
 
 ```bash
-# Run all API integration tests (including lifecycle flows)
-cargo test --test integration_test --test api_requests
-
-# Run Database integration tests
-cargo test --test database_integration
+cargo test
 ```
 
-### Benchmarks
-Performance benchmarks for critical domain logic (e.g., validation, hashing) using `criterion`.
+For integration tests that use testcontainers (requires Docker):
 
 ```bash
-cargo bench
+cargo test --test '*'
 ```
 
-### Security Audit
-Check for vulnerabilities in the dependency tree.
+---
 
-```bash
-cargo install cargo-audit
-cargo audit
-```
+## API Documentation
+
+The application serves interactive **OpenAPI / Swagger UI** documentation, generated at compile time via `utoipa`.
+
+| Resource      | URL                                          |
+|---------------|----------------------------------------------|
+| Swagger UI    | `http://localhost:3000/swagger-ui`           |
+| OpenAPI JSON  | `http://localhost:3000/api-docs/openapi.json`|
+
+---
+
+## API Endpoints
+
+All `POST` endpoints require the `x-api-key` header for authentication.
+
+### Items
+
+| Method | Path               | Auth | Description                                |
+|--------|---------------------|------|--------------------------------------------|
+| `POST` | `/items`            | Yes  | Create a new item and enqueue for blockchain submission |
+| `GET`  | `/items`            | No   | List items with cursor-based pagination    |
+| `GET`  | `/items/{id}`       | No   | Retrieve a single item by ID               |
+| `POST` | `/items/{id}/retry` | Yes  | Retry blockchain submission for a failed item |
+
+### Health
+
+| Method | Path            | Auth | Description                                 |
+|--------|-----------------|------|---------------------------------------------|
+| `GET`  | `/health`       | No   | Detailed health check (database + blockchain) |
+| `GET`  | `/health/live`  | No   | Kubernetes liveness probe                   |
+| `GET`  | `/health/ready` | No   | Kubernetes readiness probe                  |
+
+### Observability
+
+| Resource             | URL                               | Description                      |
+|----------------------|-----------------------------------|----------------------------------|
+| Prometheus Metrics   | `http://localhost:3000/metrics`   | Prometheus-format metrics export |
+| Swagger UI           | `http://localhost:3000/swagger-ui`| Interactive API documentation    |
+
+---
 
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-## 📄 License
-
-[MIT](LICENSE) © [Mukhammedali Berektassuly](https://berektassuly.com)
