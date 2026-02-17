@@ -1,2 +1,7 @@
 [advisories]
-ignore = ["RUSTSEC-2023-0071"]
+# Transitive from solana-sdk (real-blockchain feature); upstream has not yet upgraded to ed25519-dalek 2.x / curve25519-dalek 4.x
+ignore = [
+  "RUSTSEC-2023-0071",
+  "RUSTSEC-2024-0344",  # curve25519-dalek timing (solana-sdk)
+  "RUSTSEC-2022-0093",  # ed25519-dalek oracle attack (solana-sdk)
+]
