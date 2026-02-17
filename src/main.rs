@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use dotenvy::dotenv;
-use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use secrecy::SecretString;
 use tokio::signal;
@@ -16,16 +15,15 @@ use testable_rust_architecture_template::api::{
     RateLimitConfig, create_router, create_router_with_rate_limit,
 };
 use testable_rust_architecture_template::app::{AppState, WorkerConfig, spawn_worker};
-use testable_rust_architecture_template::infra::RpcBlockchainClient;
-use testable_rust_architecture_template::infra::{
-    PostgresClient, PostgresConfig, signing_key_from_base58,
-};
+use testable_rust_architecture_template::domain::TransactionSigner;
+use testable_rust_architecture_template::infra::{AwsKmsSigner, LocalSigner, RpcBlockchainClient};
+use testable_rust_architecture_template::infra::{PostgresClient, PostgresConfig};
 
 /// Application configuration
 struct Config {
     database_url: String,
     blockchain_rpc_url: String,
-    signing_key: SigningKey,
+    signer: Arc<dyn TransactionSigner>,
     api_auth_key: SecretString,
     host: String,
     port: u16,
@@ -40,7 +38,7 @@ impl Config {
         let database_url = env::var("DATABASE_URL").context("DATABASE_URL not set")?;
         let blockchain_rpc_url = env::var("SOLANA_RPC_URL")
             .unwrap_or_else(|_| "https://api.devnet.solana.com".to_string());
-        let signing_key = Self::load_signing_key()?;
+        let signer = Self::load_signer()?;
         let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port = env::var("PORT")
             .ok()
@@ -66,7 +64,7 @@ impl Config {
         Ok(Self {
             database_url,
             blockchain_rpc_url,
-            signing_key,
+            signer,
             api_auth_key,
             host,
             port,
@@ -77,20 +75,32 @@ impl Config {
         })
     }
 
-    fn load_signing_key() -> Result<SigningKey> {
-        match env::var("ISSUER_PRIVATE_KEY").ok() {
-            Some(key_str)
-                if !key_str.is_empty() && key_str != "YOUR_BASE58_ENCODED_PRIVATE_KEY_HERE" =>
-            {
-                info!("Loading signing key from environment");
+    fn load_signer() -> Result<Arc<dyn TransactionSigner>> {
+        let signer_type = env::var("SIGNER_TYPE").unwrap_or_else(|_| "LOCAL".to_string());
+        let signer: Arc<dyn TransactionSigner> = match signer_type.to_uppercase().as_str() {
+            "LOCAL" => {
+                let key_str = match env::var("ISSUER_PRIVATE_KEY").ok() {
+                    Some(s) if !s.is_empty() && s != "YOUR_BASE58_ENCODED_PRIVATE_KEY_HERE" => s,
+                    _ => {
+                        warn!("No valid ISSUER_PRIVATE_KEY, generating ephemeral keypair");
+                        let ephemeral = ed25519_dalek::SigningKey::generate(&mut OsRng);
+                        bs58::encode(ephemeral.to_bytes()).into_string()
+                    }
+                };
                 let secret = SecretString::from(key_str);
-                signing_key_from_base58(&secret).context("Failed to parse ISSUER_PRIVATE_KEY")
+                Arc::new(LocalSigner::new(secret).context("Failed to parse ISSUER_PRIVATE_KEY")?)
             }
-            _ => {
-                warn!("No valid ISSUER_PRIVATE_KEY, generating ephemeral keypair");
-                Ok(SigningKey::generate(&mut OsRng))
+            "KMS" => {
+                let key_id =
+                    env::var("KMS_KEY_ID").context("KMS_KEY_ID required when SIGNER_TYPE=KMS")?;
+                info!(key_id = %key_id, "Using AWS KMS signer (mock)");
+                Arc::new(AwsKmsSigner::new(key_id))
             }
-        }
+            other => {
+                anyhow::bail!("Invalid SIGNER_TYPE '{}': must be LOCAL or KMS", other);
+            }
+        };
+        Ok(signer)
     }
 }
 
@@ -140,7 +150,7 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
 
-    let public_key = bs58::encode(config.signing_key.verifying_key().as_bytes()).into_string();
+    let public_key = config.signer.public_key();
     info!("🔑 Public key: {}", public_key);
 
     info!("📦 Initializing infrastructure...");
@@ -151,9 +161,9 @@ async fn main() -> Result<()> {
     postgres_client.run_migrations().await?;
     info!("   ✓ Database connected and migrations applied");
 
-    // Initialize blockchain client
+    // Initialize blockchain client (signer injected; no raw key in client)
     let blockchain_client =
-        RpcBlockchainClient::with_defaults(&config.blockchain_rpc_url, config.signing_key)?;
+        RpcBlockchainClient::with_defaults(&config.blockchain_rpc_url, Arc::clone(&config.signer))?;
     info!("   ✓ Blockchain client created");
 
     // Create application state (PostgresClient implements both ItemRepository and OutboxRepository)

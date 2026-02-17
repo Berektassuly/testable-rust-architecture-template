@@ -5,7 +5,7 @@ pub mod traits;
 pub mod types;
 
 pub use error::{BlockchainError, ConfigError, HealthCheckError, ItemError, ValidationError};
-pub use traits::{BlockchainClient, ItemRepository, OutboxRepository};
+pub use traits::{BlockchainClient, ItemRepository, OutboxRepository, TransactionSigner};
 pub use types::{
     BlockchainStatus, CreateItemRequest, ErrorDetail, ErrorResponse, HealthResponse, HealthStatus,
     Item, ItemMetadata, ItemMetadataRequest, OutboxStatus, PaginatedResponse, PaginationParams,

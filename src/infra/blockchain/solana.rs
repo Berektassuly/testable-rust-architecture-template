@@ -4,10 +4,11 @@
 //! Real blockchain functionality is enabled with the `real-blockchain` feature.
 
 use async_trait::async_trait;
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
@@ -19,7 +20,7 @@ use solana_sdk::{
 #[cfg(feature = "real-blockchain")]
 use std::str::FromStr;
 
-use crate::domain::{BlockchainClient, BlockchainError};
+use crate::domain::{BlockchainClient, BlockchainError, TransactionSigner};
 
 /// Returns true if the error indicates the blockhash has expired or is invalid on-chain.
 #[cfg(feature = "real-blockchain")]
@@ -58,7 +59,8 @@ impl Default for RpcClientConfig {
     }
 }
 
-/// Abstract provider for Solana RPC interactions to enable testing
+/// Abstract provider for Solana RPC interactions to enable testing.
+/// Signing is handled by a separate [TransactionSigner]; the provider is RPC-only.
 #[async_trait]
 pub trait SolanaRpcProvider: Send + Sync {
     /// Send a JSON-RPC request
@@ -67,27 +69,16 @@ pub trait SolanaRpcProvider: Send + Sync {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, BlockchainError>;
-
-    /// Get the provider's public key
-    fn public_key(&self) -> String;
-
-    /// Sign a message
-    fn sign(&self, message: &[u8]) -> String;
 }
 
-/// HTTP-based Solana RPC provider
+/// HTTP-based Solana RPC provider (RPC only; no signing).
 pub struct HttpSolanaRpcProvider {
     http_client: Client,
     rpc_url: String,
-    signing_key: SigningKey,
 }
 
 impl HttpSolanaRpcProvider {
-    pub fn new(
-        rpc_url: &str,
-        signing_key: SigningKey,
-        timeout: Duration,
-    ) -> Result<Self, BlockchainError> {
+    pub fn new(rpc_url: &str, timeout: Duration) -> Result<Self, BlockchainError> {
         let http_client = Client::builder()
             .timeout(timeout)
             .build()
@@ -96,7 +87,6 @@ impl HttpSolanaRpcProvider {
         Ok(Self {
             http_client,
             rpc_url: rpc_url.to_string(),
-            signing_key,
         })
     }
 }
@@ -149,20 +139,12 @@ impl SolanaRpcProvider for HttpSolanaRpcProvider {
             .result
             .ok_or_else(|| BlockchainError::SubmissionFailed("Empty response".to_string()))
     }
-
-    fn public_key(&self) -> String {
-        bs58::encode(self.signing_key.verifying_key().as_bytes()).into_string()
-    }
-
-    fn sign(&self, message: &[u8]) -> String {
-        let signature = self.signing_key.sign(message);
-        bs58::encode(signature.to_bytes()).into_string()
-    }
 }
 
-/// Solana RPC blockchain client
+/// Solana RPC blockchain client. Signing is delegated to a [TransactionSigner].
 pub struct RpcBlockchainClient {
     provider: Box<dyn SolanaRpcProvider>,
+    signer: Arc<dyn TransactionSigner>,
     config: RpcClientConfig,
 }
 
@@ -212,37 +194,43 @@ impl RpcBlockchainClient {
     /// Create a new RPC blockchain client with custom configuration
     pub fn new(
         rpc_url: &str,
-        signing_key: SigningKey,
+        signer: Arc<dyn TransactionSigner>,
         config: RpcClientConfig,
     ) -> Result<Self, BlockchainError> {
-        let provider = HttpSolanaRpcProvider::new(rpc_url, signing_key, config.timeout)?;
+        let provider = HttpSolanaRpcProvider::new(rpc_url, config.timeout)?;
         info!(rpc_url = %rpc_url, "Created blockchain client");
         Ok(Self {
             provider: Box::new(provider),
+            signer,
             config,
         })
     }
 
     /// Create a new RPC blockchain client with default configuration
-    pub fn with_defaults(rpc_url: &str, signing_key: SigningKey) -> Result<Self, BlockchainError> {
-        Self::new(rpc_url, signing_key, RpcClientConfig::default())
+    pub fn with_defaults(
+        rpc_url: &str,
+        signer: Arc<dyn TransactionSigner>,
+    ) -> Result<Self, BlockchainError> {
+        Self::new(rpc_url, signer, RpcClientConfig::default())
     }
 
     /// Create a new client with a specific provider (useful for testing)
-    pub fn with_provider(provider: Box<dyn SolanaRpcProvider>, config: RpcClientConfig) -> Self {
-        Self { provider, config }
+    pub fn with_provider(
+        provider: Box<dyn SolanaRpcProvider>,
+        signer: Arc<dyn TransactionSigner>,
+        config: RpcClientConfig,
+    ) -> Self {
+        Self {
+            provider,
+            signer,
+            config,
+        }
     }
 
-    /// Get the public key as base58 string
+    /// Get the public key as base58 string (from the signer)
     #[must_use]
     pub fn public_key(&self) -> String {
-        self.provider.public_key()
-    }
-
-    /// Sign a message and return the signature as base58
-    #[must_use]
-    pub fn sign(&self, message: &[u8]) -> String {
-        self.provider.sign(message)
+        self.signer.public_key()
     }
 
     /// Make an RPC call with retries
@@ -284,7 +272,7 @@ impl RpcBlockchainClient {
     /// Build and serialize a memo transaction using solana-sdk for protocol-compliant
     /// construction. Supports memos of any length (no 127-byte truncation).
     #[cfg(feature = "real-blockchain")]
-    fn build_memo_transaction(
+    async fn build_memo_transaction(
         &self,
         memo: &str,
         recent_blockhash: &str,
@@ -295,7 +283,7 @@ impl RpcBlockchainClient {
             .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
         let blockhash = Hash::from_str(recent_blockhash)
             .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
-        let payer_pubkey = Pubkey::from_str(&self.provider.public_key())
+        let payer_pubkey = Pubkey::from_str(&self.signer.public_key())
             .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
 
         let instruction = Instruction::new_with_bytes(memo_program_id, memo.as_bytes(), vec![]);
@@ -304,7 +292,7 @@ impl RpcBlockchainClient {
 
         let mut tx = Transaction::new_unsigned(message);
         let message_data = tx.message_data();
-        let signature_str = self.provider.sign(&message_data);
+        let signature_str = self.signer.sign_message(&message_data).await?;
         let signature_bytes = bs58::decode(&signature_str)
             .into_vec()
             .map_err(|e| BlockchainError::SubmissionFailed(e.to_string()))?;
@@ -355,12 +343,13 @@ impl BlockchainClient for RpcBlockchainClient {
             };
 
             // CV-01: Propagate blockhash_used on build failure so service can persist for retry.
-            let tx = self.build_memo_transaction(hash, &blockhash).map_err(|e| {
-                BlockchainError::SubmissionFailedWithBlockhash {
+            let tx = self
+                .build_memo_transaction(hash, &blockhash)
+                .await
+                .map_err(|e| BlockchainError::SubmissionFailedWithBlockhash {
                     message: e.to_string(),
                     blockhash_used: blockhash.clone(),
-                }
-            })?;
+                })?;
             debug!("Built memo transaction");
 
             // CV-01: On send failure (Timeout, NetworkError, SubmissionFailed), we must
@@ -387,11 +376,14 @@ impl BlockchainClient for RpcBlockchainClient {
 
         #[cfg(not(feature = "real-blockchain"))]
         {
-            let signature = self.sign(hash.as_bytes());
+            let signature = self.signer.sign_message(hash.as_bytes()).await?;
             let blockhash_used = existing_blockhash
                 .map(String::from)
                 .unwrap_or_else(|| "mock_blockhash".to_string());
-            Ok((format!("tx_{}", &signature[..16]), blockhash_used))
+            Ok((
+                format!("tx_{}", &signature[..16.min(signature.len())]),
+                blockhash_used,
+            ))
         }
     }
 
@@ -494,22 +486,28 @@ pub fn signing_key_from_base58(secret: &SecretString) -> Result<SigningKey, Bloc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::blockchain::signer::LocalSigner;
     use rand::rngs::OsRng;
+
+    fn test_signer_with_key(signing_key: &SigningKey) -> Arc<dyn TransactionSigner> {
+        let secret = SecretString::from(bs58::encode(signing_key.to_bytes()).into_string());
+        Arc::new(LocalSigner::new(secret).unwrap())
+    }
 
     #[test]
     fn test_client_creation() {
         let signing_key = SigningKey::generate(&mut OsRng);
-        let client =
-            RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key);
+        let signer = test_signer_with_key(&signing_key);
+        let client = RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signer);
         assert!(client.is_ok());
     }
 
     #[test]
     fn test_public_key_generation() {
         let signing_key = SigningKey::generate(&mut OsRng);
+        let signer = test_signer_with_key(&signing_key);
         let client =
-            RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
-                .unwrap();
+            RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signer).unwrap();
         let pubkey = client.public_key();
         assert!(!pubkey.is_empty());
         // Verify it decodes to 32 bytes (length can be 43 or 44 chars)
@@ -519,13 +517,13 @@ mod tests {
         assert_eq!(decoded.len(), 32);
     }
 
-    #[test]
-    fn test_signing() {
+    #[tokio::test]
+    async fn test_signing() {
         let signing_key = SigningKey::generate(&mut OsRng);
+        let signer = test_signer_with_key(&signing_key);
         let client =
-            RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
-                .unwrap();
-        let signature = client.sign(b"test message");
+            RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signer).unwrap();
+        let signature = client.signer.sign_message(b"test message").await.unwrap();
         assert!(!signature.is_empty());
     }
 
@@ -593,20 +591,24 @@ mod tests {
         assert_eq!(config.confirmation_timeout, Duration::from_secs(120));
     }
 
-    #[test]
-    fn test_signing_determinism() {
+    #[tokio::test]
+    async fn test_signing_determinism() {
         let signing_key = SigningKey::generate(&mut OsRng);
+        let signer = test_signer_with_key(&signing_key);
         let client =
-            RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
-                .unwrap();
+            RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signer).unwrap();
 
         // Same message should produce same signature
-        let sig1 = client.sign(b"test message");
-        let sig2 = client.sign(b"test message");
+        let sig1 = client.signer.sign_message(b"test message").await.unwrap();
+        let sig2 = client.signer.sign_message(b"test message").await.unwrap();
         assert_eq!(sig1, sig2);
 
         // Different message should produce different signature
-        let sig3 = client.sign(b"different message");
+        let sig3 = client
+            .signer
+            .sign_message(b"different message")
+            .await
+            .unwrap();
         assert_ne!(sig1, sig3);
     }
 
@@ -629,7 +631,6 @@ mod tests {
 
     struct MockSolanaRpcProvider {
         state: Mutex<MockState>,
-        signing_key: SigningKey,
     }
 
     impl MockSolanaRpcProvider {
@@ -641,7 +642,6 @@ mod tests {
                     failure_error: None,
                     next_response: None,
                 }),
-                signing_key: SigningKey::generate(&mut OsRng),
             }
         }
 
@@ -686,15 +686,6 @@ mod tests {
 
             Ok(serde_json::Value::Null)
         }
-
-        fn public_key(&self) -> String {
-            bs58::encode(self.signing_key.verifying_key().as_bytes()).into_string()
-        }
-
-        fn sign(&self, message: &[u8]) -> String {
-            let signature = self.signing_key.sign(message);
-            bs58::encode(signature.to_bytes()).into_string()
-        }
     }
 
     #[tokio::test]
@@ -706,6 +697,7 @@ mod tests {
             retry_delay: Duration::from_millis(1), // Fast retry
             ..Default::default()
         };
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
 
         // Set success response
         {
@@ -713,7 +705,7 @@ mod tests {
             state.next_response = Some(serde_json::json!(12345u64)); // Slot response
         }
 
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         // Call health_check (uses getSlot)
         let result = client.health_check().await;
@@ -729,8 +721,9 @@ mod tests {
             retry_delay: Duration::from_millis(1),
             ..Default::default()
         };
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
 
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.health_check().await;
         assert!(matches!(
@@ -752,7 +745,6 @@ mod tests {
     }
 
     struct ConfigurableMockProvider {
-        signing_key: SigningKey,
         responses: Mutex<Vec<Result<serde_json::Value, MockErrorKind>>>,
         call_count: Mutex<usize>,
     }
@@ -760,7 +752,6 @@ mod tests {
     impl ConfigurableMockProvider {
         fn new() -> Self {
             Self {
-                signing_key: SigningKey::generate(&mut OsRng),
                 responses: Mutex::new(Vec::new()),
                 call_count: Mutex::new(0),
             }
@@ -812,15 +803,6 @@ mod tests {
                 Ok(serde_json::Value::Null)
             }
         }
-
-        fn public_key(&self) -> String {
-            bs58::encode(self.signing_key.verifying_key().as_bytes()).into_string()
-        }
-
-        fn sign(&self, message: &[u8]) -> String {
-            let signature = self.signing_key.sign(message);
-            bs58::encode(signature.to_bytes()).into_string()
-        }
     }
 
     // --- ERROR HANDLING TESTS ---
@@ -833,7 +815,8 @@ mod tests {
             max_retries: 0, // No retries for this test
             ..Default::default()
         };
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.health_check().await;
         assert!(matches!(
@@ -851,7 +834,8 @@ mod tests {
             max_retries: 0,
             ..Default::default()
         };
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.health_check().await;
         assert!(matches!(
@@ -869,7 +853,8 @@ mod tests {
             max_retries: 0,
             ..Default::default()
         };
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.health_check().await;
         assert!(matches!(
@@ -972,7 +957,8 @@ mod tests {
             }]
         }))]);
         let config = RpcClientConfig::default();
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.get_transaction_status("test_sig").await;
         assert!(result.is_ok());
@@ -988,7 +974,8 @@ mod tests {
             }]
         }))]);
         let config = RpcClientConfig::default();
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.get_transaction_status("test_sig").await;
         assert!(result.is_ok());
@@ -1001,7 +988,8 @@ mod tests {
             "value": [null]
         }))]);
         let config = RpcClientConfig::default();
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.get_transaction_status("unknown_sig").await;
         assert!(result.is_ok());
@@ -1017,7 +1005,8 @@ mod tests {
             }]
         }))]);
         let config = RpcClientConfig::default();
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.get_transaction_status("failed_sig").await;
         assert!(matches!(result, Err(BlockchainError::SubmissionFailed(_))));
@@ -1033,7 +1022,8 @@ mod tests {
             }
         }))]);
         let config = RpcClientConfig::default();
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.get_latest_blockhash().await;
         assert!(result.is_ok());
@@ -1045,7 +1035,8 @@ mod tests {
         let provider =
             ConfigurableMockProvider::with_responses(vec![Ok(serde_json::json!(123456789u64))]);
         let config = RpcClientConfig::default();
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.get_block_height().await;
         assert!(result.is_ok());
@@ -1063,7 +1054,8 @@ mod tests {
             }]
         }))]);
         let config = RpcClientConfig::default();
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.wait_for_confirmation("test_sig", 5).await;
         assert!(result.is_ok());
@@ -1083,7 +1075,8 @@ mod tests {
             })),
         ]);
         let config = RpcClientConfig::default();
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         tokio::time::pause();
         let result = client.wait_for_confirmation("test_sig", 10).await;
@@ -1098,7 +1091,8 @@ mod tests {
         let responses: Vec<_> = std::iter::repeat(not_confirmed).take(100).collect();
         let provider = ConfigurableMockProvider::with_responses(responses);
         let config = RpcClientConfig::default();
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         tokio::time::pause();
         let result = client.wait_for_confirmation("never_confirmed", 1).await;
@@ -1123,7 +1117,8 @@ mod tests {
             }]
         }))]);
         let config = RpcClientConfig::default();
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.wait_for_confirmation("failed_tx", 5).await;
         assert!(matches!(result, Err(BlockchainError::SubmissionFailed(_))));
@@ -1136,7 +1131,8 @@ mod tests {
     async fn test_submit_transaction_mock_mode() {
         let provider = ConfigurableMockProvider::new();
         let config = RpcClientConfig::default();
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         // In mock mode (no real-blockchain feature), submit_transaction just signs
         let result = client.submit_transaction("test_hash_123", None).await;
@@ -1161,7 +1157,8 @@ mod tests {
             retry_delay: Duration::from_millis(1),
             ..Default::default()
         };
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.health_check().await;
         assert!(result.is_ok());
@@ -1179,7 +1176,8 @@ mod tests {
             retry_delay: Duration::from_millis(1),
             ..Default::default()
         };
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         let result = client.health_check().await;
         assert!(matches!(
@@ -1192,22 +1190,23 @@ mod tests {
 
     // --- WITH_PROVIDER CONSTRUCTOR TEST ---
 
-    #[test]
-    fn test_with_provider_constructor() {
+    #[tokio::test]
+    async fn test_with_provider_constructor() {
         let provider = ConfigurableMockProvider::new();
         let config = RpcClientConfig {
             max_retries: 5,
             timeout: Duration::from_secs(45),
             ..Default::default()
         };
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         // Verify public key is accessible
         let pubkey = client.public_key();
         assert!(!pubkey.is_empty());
 
-        // Verify signing works
-        let sig = client.sign(b"test");
+        // Verify signing works via signer
+        let sig = client.signer.sign_message(b"test").await.unwrap();
         assert!(!sig.is_empty());
     }
 
@@ -1215,45 +1214,33 @@ mod tests {
 
     #[test]
     fn test_http_solana_rpc_provider_creation() {
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let result = HttpSolanaRpcProvider::new(
-            "https://api.devnet.solana.com",
-            signing_key,
-            Duration::from_secs(30),
-        );
+        let result =
+            HttpSolanaRpcProvider::new("https://api.devnet.solana.com", Duration::from_secs(30));
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_http_solana_rpc_provider_public_key() {
+    fn test_http_solana_rpc_provider_with_client_public_key() {
         let signing_key = SigningKey::generate(&mut OsRng);
-        let provider = HttpSolanaRpcProvider::new(
-            "https://api.devnet.solana.com",
-            signing_key.clone(),
-            Duration::from_secs(30),
-        )
-        .unwrap();
+        let signer = test_signer_with_key(&signing_key);
+        let client =
+            RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signer).unwrap();
 
-        let pubkey = provider.public_key();
+        let pubkey = client.public_key();
         assert!(!pubkey.is_empty());
-        // Verify it matches the expected public key
         let expected = bs58::encode(signing_key.verifying_key().as_bytes()).into_string();
         assert_eq!(pubkey, expected);
     }
 
-    #[test]
-    fn test_http_solana_rpc_provider_sign() {
+    #[tokio::test]
+    async fn test_http_solana_rpc_provider_with_client_sign() {
         let signing_key = SigningKey::generate(&mut OsRng);
-        let provider = HttpSolanaRpcProvider::new(
-            "https://api.devnet.solana.com",
-            signing_key,
-            Duration::from_secs(30),
-        )
-        .unwrap();
+        let signer = test_signer_with_key(&signing_key);
+        let client =
+            RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signer).unwrap();
 
-        let signature = provider.sign(b"test message");
+        let signature = client.signer.sign_message(b"test message").await.unwrap();
         assert!(!signature.is_empty());
-        // Signature should be base58 encoded
         let decoded = bs58::decode(&signature).into_vec();
         assert!(decoded.is_ok());
         assert_eq!(decoded.unwrap().len(), 64); // Ed25519 signature is 64 bytes
@@ -1331,7 +1318,8 @@ mod tests {
             max_retries: 0,
             ..Default::default()
         };
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         // get_block_height expects u64, but we return a string
         let result = client.get_block_height().await;
@@ -1351,7 +1339,8 @@ mod tests {
             max_retries: 0,
             ..Default::default()
         };
-        let client = RpcBlockchainClient::with_provider(Box::new(provider), config);
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client = RpcBlockchainClient::with_provider(Box::new(provider), signer, config);
 
         // Try to get block height - provider returns null which can't deserialize to u64
         let result = client.get_block_height().await;
@@ -1385,16 +1374,17 @@ mod tests {
     mod real_blockchain_tests {
         use super::*;
 
-        #[test]
-        fn test_build_memo_transaction_success() {
+        #[tokio::test]
+        async fn test_build_memo_transaction_success() {
             let signing_key = SigningKey::generate(&mut OsRng);
+            let signer = test_signer_with_key(&signing_key);
             let client =
-                RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
+                RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signer)
                     .unwrap();
 
             // Use a valid base58 blockhash (32 bytes)
             let blockhash = "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTy5nRhVT3";
-            let result = client.build_memo_transaction("test_memo", blockhash);
+            let result = client.build_memo_transaction("test_memo", blockhash).await;
             assert!(result.is_ok());
 
             let tx = result.unwrap();
@@ -1402,31 +1392,35 @@ mod tests {
             assert!(bs58::decode(&tx).into_vec().is_ok());
         }
 
-        #[test]
-        fn test_build_memo_transaction_invalid_blockhash() {
+        #[tokio::test]
+        async fn test_build_memo_transaction_invalid_blockhash() {
             let signing_key = SigningKey::generate(&mut OsRng);
+            let signer = test_signer_with_key(&signing_key);
             let client =
-                RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
+                RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signer)
                     .unwrap();
 
             // Invalid base58 blockhash
-            let result = client.build_memo_transaction("test_memo", "invalid!!!");
+            let result = client
+                .build_memo_transaction("test_memo", "invalid!!!")
+                .await;
             assert!(matches!(result, Err(BlockchainError::SubmissionFailed(_))));
         }
 
         /// Verifies memos longer than 127 bytes are not truncated (no u8 length encoding).
-        #[test]
-        fn test_build_memo_transaction_long_memo() {
+        #[tokio::test]
+        async fn test_build_memo_transaction_long_memo() {
             let signing_key = SigningKey::generate(&mut OsRng);
+            let signer = test_signer_with_key(&signing_key);
             let client =
-                RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
+                RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signer)
                     .unwrap();
 
             let blockhash = "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTy5nRhVT3";
             let long_memo: String = (0..200).map(|i| ((i % 26) as u8 + b'a') as char).collect();
             assert!(long_memo.len() > 127, "test memo must exceed 127 bytes");
 
-            let result = client.build_memo_transaction(&long_memo, blockhash);
+            let result = client.build_memo_transaction(&long_memo, blockhash).await;
             assert!(result.is_ok(), "long memo must succeed without truncation");
             let tx = result.unwrap();
             assert!(bs58::decode(&tx).into_vec().is_ok());
@@ -1437,8 +1431,9 @@ mod tests {
             // This test would need a mock RPC server to fully test
             // For now, we just verify the code compiles with the feature
             let signing_key = SigningKey::generate(&mut OsRng);
+            let signer = test_signer_with_key(&signing_key);
             let client =
-                RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signing_key)
+                RpcBlockchainClient::with_defaults("https://api.devnet.solana.com", signer)
                     .unwrap();
 
             // Can't actually test without network, but verify the method exists
@@ -1451,28 +1446,30 @@ mod tests {
     #[test]
     fn test_rpc_blockchain_client_new() {
         let signing_key = SigningKey::generate(&mut OsRng);
+        let signer = test_signer_with_key(&signing_key);
         let config = RpcClientConfig {
             timeout: Duration::from_secs(15),
             max_retries: 2,
             retry_delay: Duration::from_millis(250),
             confirmation_timeout: Duration::from_secs(30),
         };
-        let result = RpcBlockchainClient::new("https://api.devnet.solana.com", signing_key, config);
+        let result = RpcBlockchainClient::new("https://api.devnet.solana.com", signer, config);
         assert!(result.is_ok());
     }
 
     // --- PROVIDER TRAIT OBJECT TESTS ---
 
-    #[test]
-    fn test_provider_as_trait_object() {
+    #[tokio::test]
+    async fn test_provider_as_trait_object() {
         let provider: Box<dyn SolanaRpcProvider> = Box::new(ConfigurableMockProvider::new());
+        let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
+        let client =
+            RpcBlockchainClient::with_provider(provider, signer, RpcClientConfig::default());
 
-        // Test public_key through trait object
-        let pubkey = provider.public_key();
+        // Test public key and signing through client (signer provides them)
+        let pubkey = client.public_key();
         assert!(!pubkey.is_empty());
-
-        // Test sign through trait object
-        let sig = provider.sign(b"message");
+        let sig = client.signer.sign_message(b"message").await.unwrap();
         assert!(!sig.is_empty());
     }
 

@@ -9,6 +9,17 @@ use super::types::{
 };
 use chrono::{DateTime, Utc};
 
+/// Transaction signer abstraction for chain operations.
+/// Decouples signing from the RPC client to support HSM, AWS KMS, and local keys.
+#[async_trait]
+pub trait TransactionSigner: Send + Sync {
+    /// Sign a message and return the signature as Base58.
+    async fn sign_message(&self, message: &[u8]) -> Result<String, BlockchainError>;
+
+    /// Return the signer's public key as Base58 (e.g. Solana address).
+    fn public_key(&self) -> String;
+}
+
 /// Item repository for domain entity persistence (CRUD and blockchain status).
 #[async_trait]
 pub trait ItemRepository: Send + Sync {
