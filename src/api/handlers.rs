@@ -305,14 +305,14 @@ impl IntoResponse for CreateItemError {
 mod tests {
     use super::*;
     use crate::domain::ItemRepository;
-    use crate::test_utils::{MockBlockchainClient, MockProvider, mock_repos};
+    use crate::test_utils::{MockBlockchainClient, MockProvider, mock_repos, test_api_key};
 
     #[tokio::test]
     async fn test_create_item_handler() {
         let mock = Arc::new(MockProvider::new());
         let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc, test_api_key()));
 
         let payload = CreateItemRequest {
             name: "Test Item".to_string(),
@@ -336,7 +336,7 @@ mod tests {
         let mock = Arc::new(MockProvider::new());
         let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc, test_api_key()));
 
         // Seed item
         let req = CreateItemRequest::new("Seed".to_string(), "Content".to_string());
@@ -353,7 +353,7 @@ mod tests {
         let mock = Arc::new(MockProvider::new());
         let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc, test_api_key()));
 
         let Json(resp) = health_check_handler(State(state)).await;
         assert_eq!(resp.status, HealthStatus::Healthy);
@@ -363,7 +363,7 @@ mod tests {
         let mock = Arc::new(MockProvider::new());
         let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc, test_api_key()));
 
         // Test with limit > 100
         let params_high = PaginationParams {
@@ -389,7 +389,7 @@ mod tests {
         let mock = Arc::new(MockProvider::new());
         let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc, test_api_key()));
 
         let result = get_item_handler(State(state), Path("non-existent-id".to_string())).await;
 
@@ -406,7 +406,7 @@ mod tests {
         let mock = Arc::new(MockProvider::new());
         let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc, test_api_key()));
 
         // Seed item
         let req = CreateItemRequest::new("Retry Item".to_string(), "Content".to_string());
@@ -440,7 +440,7 @@ mod tests {
         let mock = Arc::new(MockProvider::new());
         let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc, test_api_key()));
 
         let status = readiness_handler(State(state)).await;
         assert_eq!(status, StatusCode::OK);
@@ -526,7 +526,7 @@ mod tests {
         let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
         bc.set_healthy(false);
-        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc, test_api_key()));
 
         let status = readiness_handler(State(state)).await;
         // Unhealthy blockchain makes overall status Unhealthy
@@ -538,7 +538,7 @@ mod tests {
         let mock = Arc::new(MockProvider::new());
         let (item_repo, outbox_repo) = mock_repos(&mock);
         let bc = Arc::new(MockBlockchainClient::new());
-        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc));
+        let state = Arc::new(AppState::new(item_repo, outbox_repo, bc, test_api_key()));
 
         let result = retry_blockchain_handler(State(state), Path("nonexistent".to_string())).await;
         assert!(matches!(result, Err(ItemError::NotFound(_))));

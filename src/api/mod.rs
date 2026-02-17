@@ -1,6 +1,7 @@
 //! The API layer, containing web handlers and routing.
 
 pub mod handlers;
+pub mod middleware;
 pub mod router;
 
 pub use handlers::ApiDoc;

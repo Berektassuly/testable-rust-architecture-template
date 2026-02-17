@@ -12,14 +12,19 @@ use testable_rust_architecture_template::api::create_router;
 use testable_rust_architecture_template::app::AppState;
 use testable_rust_architecture_template::domain::{CreateItemRequest, Item, PaginatedResponse};
 use testable_rust_architecture_template::test_utils::{
-    MockBlockchainClient, MockProvider, mock_repos,
+    MockBlockchainClient, MockProvider, mock_repos, test_api_key,
 };
 
 fn create_test_state() -> Arc<AppState> {
     let mock = Arc::new(MockProvider::new());
     let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
-    Arc::new(AppState::new(item_repo, outbox_repo, blockchain))
+    Arc::new(AppState::new(
+        item_repo,
+        outbox_repo,
+        blockchain,
+        test_api_key(),
+    ))
 }
 
 #[tokio::test]
@@ -37,6 +42,7 @@ async fn test_full_item_lifecycle_flow() {
         .method("POST")
         .uri("/items")
         .header("Content-Type", "application/json")
+        .header("x-api-key", "test-api-key")
         .body(Body::from(serde_json::to_string(&create_payload).unwrap()))
         .unwrap();
 
@@ -100,6 +106,7 @@ async fn test_post_bad_request_validation() {
         .method("POST")
         .uri("/items")
         .header("Content-Type", "application/json")
+        .header("x-api-key", "test-api-key")
         .body(Body::from(serde_json::to_string(&bad_payload).unwrap()))
         .unwrap();
 

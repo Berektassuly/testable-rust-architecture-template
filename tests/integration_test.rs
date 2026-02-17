@@ -16,15 +16,23 @@ use testable_rust_architecture_template::domain::{
     PaginatedResponse,
 };
 use testable_rust_architecture_template::test_utils::{
-    MockBlockchainClient, MockProvider, mock_repos,
+    MockBlockchainClient, MockProvider, mock_repos, test_api_key,
 };
 
 fn create_test_state() -> Arc<AppState> {
     let mock = Arc::new(MockProvider::new());
     let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
-    Arc::new(AppState::new(item_repo, outbox_repo, blockchain))
+    Arc::new(AppState::new(
+        item_repo,
+        outbox_repo,
+        blockchain,
+        test_api_key(),
+    ))
 }
+
+const API_KEY_HEADER: &str = "x-api-key";
+const TEST_KEY: &str = "test-api-key";
 
 #[tokio::test]
 async fn test_create_item_success() {
@@ -37,6 +45,7 @@ async fn test_create_item_success() {
         .method("POST")
         .uri("/items")
         .header("Content-Type", "application/json")
+        .header(API_KEY_HEADER, TEST_KEY)
         .body(Body::from(serde_json::to_string(&payload).unwrap()))
         .unwrap();
 
@@ -60,6 +69,7 @@ async fn test_create_item_validation_error() {
         .method("POST")
         .uri("/items")
         .header("Content-Type", "application/json")
+        .header(API_KEY_HEADER, TEST_KEY)
         .body(Body::from(serde_json::to_string(&payload).unwrap()))
         .unwrap();
 
@@ -93,7 +103,12 @@ async fn test_list_items_with_pagination() {
     let mock = Arc::new(MockProvider::new());
     let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
-    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
+    let state = Arc::new(AppState::new(
+        item_repo,
+        outbox_repo,
+        blockchain,
+        test_api_key(),
+    ));
 
     // Create some items
     for i in 0..5 {
@@ -145,7 +160,12 @@ async fn test_get_item_success() {
     let mock = Arc::new(MockProvider::new());
     let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
-    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
+    let state = Arc::new(AppState::new(
+        item_repo,
+        outbox_repo,
+        blockchain,
+        test_api_key(),
+    ));
 
     // Create an item
     let payload = CreateItemRequest::new("Test Item".to_string(), "Content".to_string());
@@ -191,7 +211,12 @@ async fn test_graceful_degradation_blockchain_failure() {
     let mock = Arc::new(MockProvider::new());
     let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::failing("RPC error"));
-    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
+    let state = Arc::new(AppState::new(
+        item_repo,
+        outbox_repo,
+        blockchain,
+        test_api_key(),
+    ));
     let router = create_router(state);
 
     let payload = CreateItemRequest::new("Test".to_string(), "Content".to_string());
@@ -200,6 +225,7 @@ async fn test_graceful_degradation_blockchain_failure() {
         .method("POST")
         .uri("/items")
         .header("Content-Type", "application/json")
+        .header(API_KEY_HEADER, TEST_KEY)
         .body(Body::from(serde_json::to_string(&payload).unwrap()))
         .unwrap();
 
@@ -269,7 +295,12 @@ async fn test_readiness_unhealthy() {
     mock.set_healthy(false);
     let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
-    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
+    let state = Arc::new(AppState::new(
+        item_repo,
+        outbox_repo,
+        blockchain,
+        test_api_key(),
+    ));
     let router = create_router(state);
 
     let request = Request::builder()
@@ -287,7 +318,12 @@ async fn test_database_failure() {
     let mock = Arc::new(MockProvider::failing("DB error"));
     let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
-    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
+    let state = Arc::new(AppState::new(
+        item_repo,
+        outbox_repo,
+        blockchain,
+        test_api_key(),
+    ));
     let router = create_router(state);
 
     let payload = CreateItemRequest::new("Test".to_string(), "Content".to_string());
@@ -296,6 +332,7 @@ async fn test_database_failure() {
         .method("POST")
         .uri("/items")
         .header("Content-Type", "application/json")
+        .header(API_KEY_HEADER, TEST_KEY)
         .body(Body::from(serde_json::to_string(&payload).unwrap()))
         .unwrap();
 
@@ -347,6 +384,7 @@ async fn test_retry_handler_item_not_found() {
     let request = Request::builder()
         .method("POST")
         .uri("/items/nonexistent_id/retry")
+        .header(API_KEY_HEADER, TEST_KEY)
         .body(Body::empty())
         .unwrap();
 
@@ -359,7 +397,12 @@ async fn test_retry_handler_not_eligible() {
     let mock = Arc::new(MockProvider::new());
     let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
-    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
+    let state = Arc::new(AppState::new(
+        item_repo,
+        outbox_repo,
+        blockchain,
+        test_api_key(),
+    ));
 
     // Create an item and force it to Submitted status (not eligible for retry)
     let payload = CreateItemRequest::new("Test Item".to_string(), "Content".to_string());
@@ -383,6 +426,7 @@ async fn test_retry_handler_not_eligible() {
     let request = Request::builder()
         .method("POST")
         .uri(format!("/items/{}/retry", created_item.id))
+        .header(API_KEY_HEADER, TEST_KEY)
         .body(Body::empty())
         .unwrap();
 
@@ -400,6 +444,7 @@ async fn test_create_item_malformed_json() {
         .method("POST")
         .uri("/items")
         .header("Content-Type", "application/json")
+        .header(API_KEY_HEADER, TEST_KEY)
         .body(Body::from("{ invalid json }"))
         .unwrap();
 
@@ -429,7 +474,12 @@ async fn test_health_check_degraded() {
     let (item_repo, outbox_repo) = mock_repos(&mock);
     let blockchain = Arc::new(MockBlockchainClient::new());
     blockchain.set_healthy(false);
-    let state = Arc::new(AppState::new(item_repo, outbox_repo, blockchain));
+    let state = Arc::new(AppState::new(
+        item_repo,
+        outbox_repo,
+        blockchain,
+        test_api_key(),
+    ));
     let router = create_router(state);
 
     let request = Request::builder()
@@ -469,6 +519,7 @@ async fn test_create_item_with_metadata() {
         .method("POST")
         .uri("/items")
         .header("Content-Type", "application/json")
+        .header(API_KEY_HEADER, TEST_KEY)
         .body(Body::from(serde_json::to_string(&payload).unwrap()))
         .unwrap();
 

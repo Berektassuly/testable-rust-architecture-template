@@ -26,6 +26,7 @@ struct Config {
     database_url: String,
     blockchain_rpc_url: String,
     signing_key: SigningKey,
+    api_auth_key: SecretString,
     host: String,
     port: u16,
     enable_rate_limiting: bool,
@@ -52,6 +53,10 @@ impl Config {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(true);
 
+        let api_auth_key = env::var("API_AUTH_KEY")
+            .context("API_AUTH_KEY not set - security requires this environment variable")?;
+        let api_auth_key = SecretString::from(api_auth_key);
+
         let rate_limit_config = RateLimitConfig::from_env();
         let worker_config = WorkerConfig {
             enabled: enable_background_worker,
@@ -62,6 +67,7 @@ impl Config {
             database_url,
             blockchain_rpc_url,
             signing_key,
+            api_auth_key,
             host,
             port,
             enable_rate_limiting,
@@ -160,6 +166,7 @@ async fn main() -> Result<()> {
         item_repo,
         outbox_repo,
         Arc::new(blockchain_client),
+        config.api_auth_key,
     ));
 
     // Start background worker if enabled

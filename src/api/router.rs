@@ -31,6 +31,7 @@ use super::handlers::{
     ApiDoc, create_item_handler, get_item_handler, health_check_handler, list_items_handler,
     liveness_handler, readiness_handler, retry_blockchain_handler,
 };
+use super::middleware::auth_middleware;
 
 /// Rate limiter configuration
 #[derive(Debug, Clone)]
@@ -237,11 +238,15 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
             Duration::from_secs(30),
         ));
 
-    // Items routes
+    // Items routes (auth middleware protects POST endpoints)
     let items_routes = Router::new()
         .route("/", post(create_item_handler).get(list_items_handler))
         .route("/{id}", get(get_item_handler))
-        .route("/{id}/retry", post(retry_blockchain_handler));
+        .route("/{id}/retry", post(retry_blockchain_handler))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&app_state),
+            auth_middleware,
+        ));
 
     // Health routes
     let health_routes = Router::new()
@@ -272,11 +277,15 @@ pub fn create_router_with_rate_limit(app_state: Arc<AppState>, config: RateLimit
             Duration::from_secs(30),
         ));
 
-    // Items routes with rate limiting
+    // Items routes with auth (POST protected) and rate limiting
     let items_routes = Router::new()
         .route("/", post(create_item_handler).get(list_items_handler))
         .route("/{id}", get(get_item_handler))
         .route("/{id}/retry", post(retry_blockchain_handler))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&app_state),
+            auth_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&rate_limit_state),
             rate_limit_items_middleware,
@@ -319,14 +328,14 @@ mod tests {
         use std::sync::Arc;
 
         use crate::app::AppState;
-        use crate::test_utils::{MockBlockchainClient, MockProvider, mock_repos};
+        use crate::test_utils::{MockBlockchainClient, MockProvider, mock_repos, test_api_key};
 
         impl AppState {
             pub fn new_for_test() -> Arc<Self> {
                 let mock = Arc::new(MockProvider::new());
                 let (item_repo, outbox_repo) = mock_repos(&mock);
                 let bc = Arc::new(MockBlockchainClient::new());
-                Arc::new(AppState::new(item_repo, outbox_repo, bc))
+                Arc::new(AppState::new(item_repo, outbox_repo, bc, test_api_key()))
             }
         }
     }
@@ -671,6 +680,76 @@ mod tests {
                 .unwrap();
 
             assert!(response.headers().contains_key("Retry-After"));
+        }
+    }
+
+    mod auth_middleware_tests {
+        use super::*;
+        use crate::app::AppState;
+
+        #[tokio::test]
+        async fn test_post_without_api_key_returns_401() {
+            let app_state = AppState::new_for_test();
+            let router = create_router(app_state);
+
+            let request = Request::builder()
+                .method("POST")
+                .uri("/items")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"name":"Test","content":"x"}"#))
+                .unwrap();
+
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn test_post_with_invalid_api_key_returns_401() {
+            let app_state = AppState::new_for_test();
+            let router = create_router(app_state);
+
+            let request = Request::builder()
+                .method("POST")
+                .uri("/items")
+                .header("Content-Type", "application/json")
+                .header("x-api-key", "wrong-key")
+                .body(Body::from(r#"{"name":"Test","content":"x"}"#))
+                .unwrap();
+
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn test_post_with_valid_api_key_returns_200() {
+            let app_state = AppState::new_for_test();
+            let router = create_router(app_state);
+
+            let request = Request::builder()
+                .method("POST")
+                .uri("/items")
+                .header("Content-Type", "application/json")
+                .header("x-api-key", "test-api-key")
+                .body(Body::from(r#"{"name":"Test","content":"x"}"#))
+                .unwrap();
+
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn test_get_without_api_key_allowed() {
+            let app_state = AppState::new_for_test();
+            let router = create_router(app_state);
+
+            let request = Request::builder()
+                .method("GET")
+                .uri("/items")
+                .body(Body::empty())
+                .unwrap();
+
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
         }
     }
 
