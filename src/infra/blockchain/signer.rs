@@ -190,7 +190,10 @@ impl TransactionSigner for AwsKmsSigner {
             .key_id(&self.key_id)
             .message(Blob::new(message))
             .message_type(MessageType::Raw)
-            .signing_algorithm(SigningAlgorithmSpec::Ed25519)
+            // AWS KMS API value for Ed25519 signing (EdDSA with SHA-512).
+            // Constructed from string because the SDK enum doesn't have a
+            // named variant for Ed25519 yet.
+            .signing_algorithm(SigningAlgorithmSpec::from("ED25519_SHA_512"))
             .send()
             .await
             .map_err(|e| BlockchainError::SubmissionFailed(format!("KMS Sign failed: {e}")))?;
