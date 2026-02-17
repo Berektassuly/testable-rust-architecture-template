@@ -1140,7 +1140,7 @@ mod tests {
     async fn test_wait_for_confirmation_timeout() {
         // Always return not confirmed; may hit timeout or exhaust mock depending on timing
         let not_confirmed = Ok(serde_json::json!({"value": [null]}));
-        let responses: Vec<_> = std::iter::repeat(not_confirmed).take(100).collect();
+        let responses: Vec<_> = std::iter::repeat_n(not_confirmed, 100).collect();
         let provider = ConfigurableMockProvider::with_responses(responses);
         let config = RpcClientConfig::default();
         let signer = test_signer_with_key(&SigningKey::generate(&mut OsRng));
