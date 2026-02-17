@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{Request, Response, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -43,6 +43,9 @@ pub struct RateLimitConfig {
     pub health_rps: u32,
     /// Burst size for health endpoints
     pub health_burst: u32,
+    /// CV-02: If true, allow using X-Forwarded-For / X-Real-IP when ConnectInfo is missing.
+    /// Default false (safe): only use ConnectInfo so rate limiting cannot be bypassed by spoofed headers.
+    pub trust_proxy_headers: bool,
 }
 
 impl Default for RateLimitConfig {
@@ -52,6 +55,7 @@ impl Default for RateLimitConfig {
             general_burst: 20,
             health_rps: 100,
             health_burst: 100,
+            trust_proxy_headers: false,
         }
     }
 }
@@ -73,6 +77,7 @@ impl RateLimitConfig {
             general_burst,
             health_rps: 100,
             health_burst: 100,
+            trust_proxy_headers: false,
         }
     }
 }
@@ -107,32 +112,39 @@ impl RateLimitState {
     }
 }
 
-/// Extract client IP from request (X-Forwarded-For, X-Real-IP, or ConnectInfo).
-/// Falls back to 0.0.0.0 when unknown to avoid blocking; unknown clients share one bucket.
-fn client_ip_from_request<B>(request: &Request<B>) -> IpAddr {
-    // Prefer proxy headers (client is first in X-Forwarded-For)
-    if let Some(forwarded) = request.headers().get("x-forwarded-for") {
-        if let Ok(s) = forwarded.to_str() {
-            if let Some(first) = s.split(',').next() {
-                let trimmed = first.trim();
-                if let Ok(ip) = trimmed.parse::<IpAddr>() {
+/// CV-02 remediation: Extract client IP for rate limiting.
+/// Prioritizes ConnectInfo (from axum into_make_service_with_connect_info) as the
+/// source of truth so that spoofed X-Forwarded-For / X-Real-IP cannot bypass limits.
+/// Headers are only used when trust_proxy_headers is true (e.g. behind a trusted proxy).
+fn client_ip_from_request<B>(request: &Request<B>, trust_proxy_headers: bool) -> IpAddr {
+    // Source of truth: connection peer from the TCP layer (not spoofable).
+    if let Some(connect_info) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
+        return connect_info.0.ip();
+    }
+    if let Some(addr) = request.extensions().get::<SocketAddr>() {
+        return addr.ip();
+    }
+    // Only use headers when explicitly configured to trust upstream proxies.
+    if trust_proxy_headers {
+        if let Some(forwarded) = request.headers().get("x-forwarded-for") {
+            if let Ok(s) = forwarded.to_str() {
+                if let Some(first) = s.split(',').next() {
+                    let trimmed = first.trim();
+                    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+                        return ip;
+                    }
+                }
+            }
+        }
+        if let Some(real_ip) = request.headers().get("x-real-ip") {
+            if let Ok(s) = real_ip.to_str() {
+                if let Ok(ip) = s.trim().parse::<IpAddr>() {
                     return ip;
                 }
             }
         }
     }
-    if let Some(real_ip) = request.headers().get("x-real-ip") {
-        if let Ok(s) = real_ip.to_str() {
-            if let Ok(ip) = s.trim().parse::<IpAddr>() {
-                return ip;
-            }
-        }
-    }
-    // ConnectInfo may inject SocketAddr when using into_make_service_with_connect_info
-    if let Some(addr) = request.extensions().get::<SocketAddr>() {
-        return addr.ip();
-    }
-    // Fallback: unknown clients share one bucket (prevents total global DoS)
+    // Fallback: unknown clients share one bucket (prevents total global DoS).
     IpAddr::V4(Ipv4Addr::UNSPECIFIED)
 }
 
@@ -142,7 +154,7 @@ async fn rate_limit_items_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
-    let client_ip = client_ip_from_request(&request);
+    let client_ip = client_ip_from_request(&request, rate_limit.config.trust_proxy_headers);
     match rate_limit.items_limiter.check_key(&client_ip) {
         Ok(_) => {
             let mut response = next.run(request).await;
@@ -187,7 +199,7 @@ async fn rate_limit_health_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
-    let client_ip = client_ip_from_request(&request);
+    let client_ip = client_ip_from_request(&request, rate_limit.config.trust_proxy_headers);
     match rate_limit.health_limiter.check_key(&client_ip) {
         Ok(_) => next.run(request).await,
         Err(not_until) => {
@@ -343,6 +355,7 @@ mod tests {
                 general_burst: 100,
                 health_rps: 200,
                 health_burst: 200,
+                trust_proxy_headers: false,
             };
             assert_eq!(config.general_rps, 50);
             assert_eq!(config.general_burst, 100);
@@ -368,6 +381,7 @@ mod tests {
                 general_burst: 84,
                 health_rps: 100,
                 health_burst: 100,
+                trust_proxy_headers: false,
             };
             let config2 = config1.clone();
             assert_eq!(config1.general_rps, config2.general_rps);
@@ -524,6 +538,7 @@ mod tests {
                 general_burst: 1,
                 health_rps: 100,
                 health_burst: 100,
+                trust_proxy_headers: false,
             };
 
             let state = Arc::new(RateLimitState::new(config));
@@ -554,6 +569,7 @@ mod tests {
                 general_burst: 100,
                 health_rps: 1,
                 health_burst: 1,
+                trust_proxy_headers: false,
             };
 
             let state = Arc::new(RateLimitState::new(config));
@@ -583,6 +599,7 @@ mod tests {
         }
 
         /// Verifies per-IP rate limiting: one IP exhausting limit does not block another.
+        /// Uses ConnectInfo (source of truth) so behavior is correct when trust_proxy_headers is false.
         #[tokio::test]
         async fn test_rate_limit_per_ip_prevents_global_dos() {
             let config = RateLimitConfig {
@@ -601,29 +618,23 @@ mod tests {
                         rate_limit_items_middleware,
                     ));
 
-            // Exhaust limit for IP 192.168.1.1
-            let req1 = Request::builder()
-                .uri("/")
-                .header("X-Forwarded-For", "192.168.1.1")
-                .body(Body::empty())
-                .unwrap();
+            // Exhaust limit for IP 192.168.1.1 (via ConnectInfo, not spoofable headers)
+            let mut req1 = Request::builder().uri("/").body(Body::empty()).unwrap();
+            req1.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([192, 168, 1, 1], 0))));
             app.clone().oneshot(req1).await.unwrap();
 
             // Second request from same IP should be blocked
-            let req2 = Request::builder()
-                .uri("/")
-                .header("X-Forwarded-For", "192.168.1.1")
-                .body(Body::empty())
-                .unwrap();
+            let mut req2 = Request::builder().uri("/").body(Body::empty()).unwrap();
+            req2.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([192, 168, 1, 1], 0))));
             let res2 = app.clone().oneshot(req2).await.unwrap();
             assert_eq!(res2.status(), StatusCode::TOO_MANY_REQUESTS);
 
             // Different IP should still be allowed
-            let req3 = Request::builder()
-                .uri("/")
-                .header("X-Forwarded-For", "10.0.0.1")
-                .body(Body::empty())
-                .unwrap();
+            let mut req3 = Request::builder().uri("/").body(Body::empty()).unwrap();
+            req3.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 1], 0))));
             let res3 = app.oneshot(req3).await.unwrap();
             assert_eq!(res3.status(), StatusCode::OK);
         }
@@ -635,6 +646,7 @@ mod tests {
                 general_burst: 100,
                 health_rps: 1,
                 health_burst: 1,
+                trust_proxy_headers: false,
             };
 
             let state = Arc::new(RateLimitState::new(config));
@@ -786,6 +798,7 @@ mod tests {
                 general_burst: 1,
                 health_rps: 100,
                 health_burst: 100,
+                trust_proxy_headers: false,
             };
             let router = create_router_with_rate_limit(app_state, config);
 
@@ -853,6 +866,7 @@ mod tests {
                 general_burst: 100,
                 health_rps: 200,
                 health_burst: 400,
+                trust_proxy_headers: false,
             };
             let _state = RateLimitState::new(config);
             // Should not panic with various configurations

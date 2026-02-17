@@ -211,15 +211,23 @@ impl AppService {
                     )
                 };
 
-                // Sticky blockhash: persist or clear for next retry.
-                // Always persist blockhash when returned (Timeout, NetworkError, etc.)
-                // so the next retry uses the same blockhash and avoids double-spending.
+                // CV-01 remediation: Sticky blockhash to prevent double-spend.
+                // We MUST NOT clear attempt_blockhash on Timeout, NetworkError, or
+                // SubmissionFailed, because the transaction may have landed on-chain
+                // despite the error. Clearing would cause the next retry to use a new
+                // blockhash and produce a new signature, risking double-spend.
+                // Only clear when we know the blockhash is invalid (BlockhashExpired).
+                // For errors that don't carry blockhash_used, pass None so we do not
+                // update the column and thus keep the existing value (safe default).
                 let attempt_blockhash = match &e {
                     BlockchainError::BlockhashExpired => Some(None),
                     BlockchainError::SubmissionFailedWithBlockhash { blockhash_used, .. } => {
                         Some(Some(blockhash_used.as_str()))
                     }
-                    _ => None,
+                    BlockchainError::Timeout(_)
+                    | BlockchainError::NetworkError(_)
+                    | BlockchainError::SubmissionFailed(_)
+                    | BlockchainError::InsufficientFunds => None,
                 };
 
                 self.outbox_repo

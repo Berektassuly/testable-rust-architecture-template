@@ -354,9 +354,19 @@ impl BlockchainClient for RpcBlockchainClient {
                 }
             };
 
-            let tx = self.build_memo_transaction(hash, &blockhash)?;
+            // CV-01: Propagate blockhash_used on build failure so service can persist for retry.
+            let tx = self.build_memo_transaction(hash, &blockhash).map_err(|e| {
+                BlockchainError::SubmissionFailedWithBlockhash {
+                    message: e.to_string(),
+                    blockhash_used: blockhash.clone(),
+                }
+            })?;
             debug!("Built memo transaction");
 
+            // CV-01: On send failure (Timeout, NetworkError, SubmissionFailed), we must
+            // propagate blockhash_used so the service persists it and does not clear it.
+            // Otherwise a retry would fetch a new blockhash and create a new signature,
+            // risking double-spend if the original transaction actually landed.
             let params = serde_json::json!([tx, {"encoding": "base58"}]);
             let signature: String =
                 self.rpc_call("sendTransaction", params)
@@ -365,8 +375,6 @@ impl BlockchainClient for RpcBlockchainClient {
                         if is_blockhash_expired(&e) {
                             BlockchainError::BlockhashExpired
                         } else {
-                            // Sticky blockhash: always include blockhash on any failure
-                            // (Timeout, NetworkError, etc.) so caller can persist for retry
                             BlockchainError::SubmissionFailedWithBlockhash {
                                 message: e.to_string(),
                                 blockhash_used: blockhash.clone(),
