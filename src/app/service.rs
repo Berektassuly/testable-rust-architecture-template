@@ -227,10 +227,13 @@ impl AppService {
                     BlockchainError::SubmissionFailedWithBlockhash { blockhash_used, .. } => {
                         Some(Some(blockhash_used.as_str()))
                     }
-                    BlockchainError::Timeout(_)
-                    | BlockchainError::NetworkError(_)
-                    | BlockchainError::SubmissionFailed(_)
-                    | BlockchainError::InsufficientFunds => None,
+                    BlockchainError::Timeout { ref blockhash, .. }
+                    | BlockchainError::NetworkError { ref blockhash, .. } => {
+                        Some(Some(blockhash.as_str()))
+                    }
+                    BlockchainError::SubmissionFailed(_) | BlockchainError::InsufficientFunds => {
+                        None
+                    }
                 };
 
                 self.outbox_repo
@@ -581,5 +584,41 @@ mod service_tests {
         assert!(updated.blockchain_next_retry_at.is_some());
         assert_eq!(updated.blockchain_retry_count, 1);
         assert!(updated.blockchain_next_retry_at.unwrap() > Utc::now());
+    }
+
+    #[tokio::test]
+    async fn test_double_spend_protection_on_timeout() {
+        // Setup mock with timeout failure that carries a sticky blockhash
+        let sticky_hash = "sticky_test_hash_abc";
+        let mock = Arc::new(MockProvider::new());
+        let (item_repo, outbox_repo) = mock_repos(&mock);
+
+        let bc = Arc::new(MockBlockchainClient::timeout_with_blockhash(sticky_hash));
+        let service = AppService::new(item_repo, outbox_repo, bc);
+
+        // Create item and trigger processing
+        let request = CreateItemRequest::new("Sticky Item".to_string(), "Content".to_string());
+        let created = service.create_and_submit_item(&request).await.unwrap();
+
+        // Process submissions - should fail with Timeout but persist the blockhash
+        service.process_pending_submissions(10).await.unwrap();
+
+        // Verification
+        let entries = mock.get_all_outbox_entries();
+        let entry = entries
+            .iter()
+            .find(|e| e.aggregate_id == created.id)
+            .unwrap();
+
+        // Assert: retry_count incremented, status still Pending (for retry)
+        assert_eq!(entry.retry_count, 1);
+        assert_eq!(entry.status, OutboxStatus::Pending);
+
+        // CRITICAL ASSERTION: attempt_blockhash MUST match the sticky hash from the error
+        assert_eq!(
+            entry.attempt_blockhash,
+            Some(sticky_hash.to_string()),
+            "Blockhash must be persisted after timeout to prevent double spend"
+        );
     }
 }

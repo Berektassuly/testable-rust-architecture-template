@@ -17,6 +17,8 @@ use crate::domain::{
 pub struct MockConfig {
     pub should_fail: bool,
     pub error_message: Option<String>,
+    pub fail_with_timeout: bool,
+    pub timeout_blockhash: Option<String>,
 }
 
 impl MockConfig {
@@ -62,6 +64,10 @@ impl MockProvider {
     #[must_use]
     pub fn failing(message: impl Into<String>) -> Self {
         Self::with_config(MockConfig::failure(message))
+    }
+    /// Get all outbox entries (for testing)
+    pub fn get_all_outbox_entries(&self) -> Vec<SolanaOutboxEntry> {
+        self.outbox.lock().unwrap().values().cloned().collect()
     }
 
     pub fn set_healthy(&self, healthy: bool) {
@@ -417,6 +423,16 @@ impl MockBlockchainClient {
         Self::with_config(MockConfig::failure(message))
     }
 
+    #[must_use]
+    pub fn timeout_with_blockhash(blockhash: impl Into<String>) -> Self {
+        Self::with_config(MockConfig {
+            should_fail: true,
+            fail_with_timeout: true,
+            timeout_blockhash: Some(blockhash.into()),
+            ..Default::default()
+        })
+    }
+
     pub fn set_healthy(&self, healthy: bool) {
         self.is_healthy.store(healthy, Ordering::Relaxed);
     }
@@ -427,6 +443,12 @@ impl MockBlockchainClient {
 
     fn check_should_fail(&self) -> Result<(), BlockchainError> {
         if self.config.should_fail {
+            if self.config.fail_with_timeout {
+                return Err(BlockchainError::Timeout {
+                    message: "Mock timeout".to_string(),
+                    blockhash: self.config.timeout_blockhash.clone().unwrap_or_default(),
+                });
+            }
             let msg = self
                 .config
                 .error_message

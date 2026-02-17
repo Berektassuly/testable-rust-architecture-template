@@ -27,12 +27,12 @@ pub enum BlockchainError {
     },
     #[error("Blockhash expired or invalid")]
     BlockhashExpired,
-    #[error("Network error: {0}")]
-    NetworkError(String),
+    #[error("Network error: {message} (blockhash_used: {blockhash})")]
+    NetworkError { message: String, blockhash: String },
     #[error("Insufficient funds for transaction")]
     InsufficientFunds,
-    #[error("Timeout: {0}")]
-    Timeout(String),
+    #[error("Timeout: {message} (blockhash_used: {blockhash})")]
+    Timeout { message: String, blockhash: String },
 }
 
 /// System health check errors.
@@ -102,12 +102,23 @@ mod tests {
     fn test_blockchain_error_display() {
         let err = BlockchainError::SubmissionFailed("rpc error".to_string());
         assert!(err.to_string().contains("Transaction submission failed"));
-        let err = BlockchainError::NetworkError("timeout".to_string());
+
+        let err = BlockchainError::NetworkError {
+            message: "timeout".to_string(),
+            blockhash: "hash123".to_string(),
+        };
         assert!(err.to_string().contains("Network error"));
+        assert!(err.to_string().contains("hash123"));
+
         let err = BlockchainError::InsufficientFunds;
         assert_eq!(err.to_string(), "Insufficient funds for transaction");
-        let err = BlockchainError::Timeout("30s".to_string());
+
+        let err = BlockchainError::Timeout {
+            message: "30s".to_string(),
+            blockhash: "hash123".to_string(),
+        };
         assert!(err.to_string().contains("Timeout"));
+        assert!(err.to_string().contains("hash123"));
     }
 
     #[test]

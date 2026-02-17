@@ -264,7 +264,7 @@ impl IntoResponse for BlockchainError {
                 "blockhash_expired",
                 "Blockhash expired or invalid".to_string(),
             ),
-            BlockchainError::NetworkError(_) => (
+            BlockchainError::NetworkError { .. } => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "blockchain_unavailable",
                 "Blockchain service unavailable".to_string(),
@@ -274,7 +274,7 @@ impl IntoResponse for BlockchainError {
                 "insufficient_funds",
                 self.to_string(),
             ),
-            BlockchainError::Timeout(_) => {
+            BlockchainError::Timeout { .. } => {
                 (StatusCode::GATEWAY_TIMEOUT, "timeout", self.to_string())
             }
         };
@@ -478,7 +478,10 @@ mod tests {
 
     #[test]
     fn test_error_mapping_blockchain_timeout() {
-        let err = BlockchainError::Timeout("5000ms".into());
+        let err = BlockchainError::Timeout {
+            message: "5000ms".to_string(),
+            blockhash: String::new(),
+        };
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     }
@@ -492,7 +495,10 @@ mod tests {
 
     #[test]
     fn test_error_mapping_blockchain_network_error() {
-        let err = BlockchainError::NetworkError("refused".into());
+        let err = BlockchainError::NetworkError {
+            message: "refused".to_string(),
+            blockhash: String::new(),
+        };
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }

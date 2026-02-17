@@ -29,9 +29,9 @@ fn blockchain_error_type(e: &BlockchainError) -> &'static str {
         BlockchainError::SubmissionFailed(_) => "submission_failed",
         BlockchainError::SubmissionFailedWithBlockhash { .. } => "submission_failed_with_blockhash",
         BlockchainError::BlockhashExpired => "blockhash_expired",
-        BlockchainError::NetworkError(_) => "network_error",
+        BlockchainError::NetworkError { .. } => "network_error",
         BlockchainError::InsufficientFunds => "insufficient_funds",
-        BlockchainError::Timeout(_) => "timeout",
+        BlockchainError::Timeout { .. } => "timeout",
     }
 }
 
@@ -92,10 +92,12 @@ pub struct HttpSolanaRpcProvider {
 
 impl HttpSolanaRpcProvider {
     pub fn new(rpc_url: &str, timeout: Duration) -> Result<Self, BlockchainError> {
-        let http_client = Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| BlockchainError::NetworkError(e.to_string()))?;
+        let http_client = Client::builder().timeout(timeout).build().map_err(|e| {
+            BlockchainError::NetworkError {
+                message: e.to_string(),
+                blockhash: String::new(),
+            }
+        })?;
 
         Ok(Self {
             http_client,
@@ -126,9 +128,15 @@ impl SolanaRpcProvider for HttpSolanaRpcProvider {
             .await
             .map_err(|e| {
                 if e.is_timeout() {
-                    BlockchainError::Timeout(e.to_string())
+                    BlockchainError::Timeout {
+                        message: e.to_string(),
+                        blockhash: String::new(),
+                    }
                 } else {
-                    BlockchainError::NetworkError(e.to_string())
+                    BlockchainError::NetworkError {
+                        message: e.to_string(),
+                        blockhash: String::new(),
+                    }
                 }
             })?;
 
@@ -416,9 +424,23 @@ impl BlockchainClient for RpcBlockchainClient {
                         if is_blockhash_expired(&e) {
                             BlockchainError::BlockhashExpired
                         } else {
-                            BlockchainError::SubmissionFailedWithBlockhash {
-                                message: e.to_string(),
-                                blockhash_used: blockhash.clone(),
+                            match e {
+                                BlockchainError::Timeout { message, .. } => {
+                                    BlockchainError::Timeout {
+                                        message,
+                                        blockhash: blockhash.clone(),
+                                    }
+                                }
+                                BlockchainError::NetworkError { message, .. } => {
+                                    BlockchainError::NetworkError {
+                                        message,
+                                        blockhash: blockhash.clone(),
+                                    }
+                                }
+                                _ => BlockchainError::SubmissionFailedWithBlockhash {
+                                    message: e.to_string(),
+                                    blockhash_used: blockhash.clone(),
+                                },
                             }
                         }
                     })?;
@@ -503,10 +525,13 @@ impl BlockchainClient for RpcBlockchainClient {
             tokio::time::sleep(poll_interval).await;
         }
 
-        Err(BlockchainError::Timeout(format!(
-            "Transaction {} not confirmed within {}s",
-            signature, timeout_secs
-        )))
+        Err(BlockchainError::Timeout {
+            message: format!(
+                "Transaction {} not confirmed within {}s",
+                signature, timeout_secs
+            ),
+            blockhash: String::new(),
+        })
     }
 }
 
@@ -722,9 +747,10 @@ mod tests {
                 state.should_fail_count -= 1;
                 if let Some(ref err) = state.failure_error {
                     return match err {
-                        BlockchainErrorType::Timeout => {
-                            Err(BlockchainError::Timeout("Mock timeout".to_string()))
-                        }
+                        BlockchainErrorType::Timeout => Err(BlockchainError::Timeout {
+                            message: "Mock timeout".to_string(),
+                            blockhash: String::new(),
+                        }),
                         BlockchainErrorType::Rpc => Err(BlockchainError::SubmissionFailed(
                             "Mock RPC error".to_string(),
                         )),
@@ -837,7 +863,10 @@ mod tests {
             if idx < responses.len() {
                 match &responses[idx] {
                     Ok(v) => Ok(v.clone()),
-                    Err(MockErrorKind::Timeout(msg)) => Err(BlockchainError::Timeout(msg.clone())),
+                    Err(MockErrorKind::Timeout(msg)) => Err(BlockchainError::Timeout {
+                        message: msg.clone(),
+                        blockhash: String::new(),
+                    }),
                     Err(MockErrorKind::RpcError(msg)) => {
                         Err(BlockchainError::SubmissionFailed(msg.clone()))
                     }
@@ -1153,7 +1182,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(BlockchainError::Timeout(_)) | Err(BlockchainError::SubmissionFailed(_))
+                Err(BlockchainError::Timeout { .. }) | Err(BlockchainError::SubmissionFailed(_))
             ),
             "expected Timeout or SubmissionFailed, got {:?}",
             result
