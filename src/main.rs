@@ -36,11 +36,11 @@ struct Config {
 }
 
 impl Config {
-    fn from_env() -> Result<Self> {
+    async fn from_env() -> Result<Self> {
         let database_url = env::var("DATABASE_URL").context("DATABASE_URL not set")?;
         let blockchain_rpc_url = env::var("SOLANA_RPC_URL")
             .unwrap_or_else(|_| "https://api.devnet.solana.com".to_string());
-        let signer = Self::load_signer()?;
+        let signer = Self::load_signer().await?;
         let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port = env::var("PORT")
             .ok()
@@ -77,7 +77,7 @@ impl Config {
         })
     }
 
-    fn load_signer() -> Result<Arc<dyn TransactionSigner>> {
+    async fn load_signer() -> Result<Arc<dyn TransactionSigner>> {
         let signer_type = env::var("SIGNER_TYPE").unwrap_or_else(|_| "LOCAL".to_string());
         let signer: Arc<dyn TransactionSigner> = match signer_type.to_uppercase().as_str() {
             "LOCAL" => {
@@ -95,8 +95,11 @@ impl Config {
             "KMS" => {
                 let key_id =
                     env::var("KMS_KEY_ID").context("KMS_KEY_ID required when SIGNER_TYPE=KMS")?;
-                info!(key_id = %key_id, "Using AWS KMS signer (mock)");
-                Arc::new(AwsKmsSigner::new(key_id))
+                info!(key_id = %key_id, "Initializing AWS KMS signer...");
+                let kms_signer = AwsKmsSigner::new(key_id)
+                    .await
+                    .context("Failed to initialize AWS KMS signer")?;
+                Arc::new(kms_signer)
             }
             other => {
                 anyhow::bail!("Invalid SIGNER_TYPE '{}': must be LOCAL or KMS", other);
@@ -150,7 +153,7 @@ async fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
-    let config = Config::from_env()?;
+    let config = Config::from_env().await?;
 
     let public_key = config.signer.public_key();
     info!("🔑 Public key: {}", public_key);
